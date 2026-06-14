@@ -262,47 +262,20 @@
 
         <!-- RECUPERAÇÃO DE SENHA -->
         <div id="recuperacao-form" style="display:none;">
-            <!-- Passo 1: e-mail -->
-            <div id="rec-passo1">
                 <div style="text-align:center;font-size:2rem;margin-bottom:8px;">🔑</div>
                 <div style="color:white;font-weight:700;font-size:1rem;margin-bottom:6px;text-align:center;">Recuperar senha</div>
                 <div style="color:rgba(255,255,255,0.45);font-size:0.78rem;margin-bottom:18px;text-align:center;line-height:1.5;">
-                    Informe seu e-mail cadastrado.<br>Geraremos um código de verificação.
+                    Informe seu e-mail cadastrado.<br>Enviaremos um link de redefinição para o seu e-mail.
                 </div>
                 <label class="login-label">E-MAIL CADASTRADO</label>
                 <input class="login-input" type="email" id="rec-email" placeholder="seu@email.com"
                     onkeydown="if(event.key==='Enter')gerarCodigoRecuperacao()">
-                <button class="login-btn" onclick="gerarCodigoRecuperacao()">GERAR CÓDIGO</button>
-            </div>
-            <!-- Passo 2: código + nova senha -->
-            <div id="rec-passo2" style="display:none;">
-                <div style="text-align:center;font-size:2rem;margin-bottom:8px;">📋</div>
-                <div style="color:white;font-weight:700;font-size:1rem;margin-bottom:4px;text-align:center;">Código de verificação</div>
-                <div style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:12px;padding:14px;margin-bottom:16px;text-align:center;">
-                    <div style="color:rgba(255,255,255,0.5);font-size:0.7rem;margin-bottom:4px;">Seu código temporário:</div>
-                    <div id="rec-codigo-display" style="font-size:2rem;font-weight:900;letter-spacing:8px;color:#f1c40f;font-family:monospace;"></div>
-                    <div style="color:rgba(255,255,255,0.35);font-size:0.68rem;margin-top:6px;">⏱️ Válido por <span id="rec-timer">5:00</span></div>
+                <button class="login-btn" onclick="gerarCodigoRecuperacao()">📧 ENVIAR LINK DE REDEFINIÇÃO</button>
+                <div class="login-toggle" style="margin-top:14px;">
+                    <span onclick="mostrarLogin()">← Voltar ao login</span>
                 </div>
-                <label class="login-label">DIGITE O CÓDIGO</label>
-                <input class="login-input" type="text" id="rec-codigo-input" placeholder="000000"
-                    maxlength="6" inputmode="numeric"
-                    oninput="this.value=this.value.replace(/[^0-9]/g,'')"
-                    style="letter-spacing:6px;font-size:1.2rem;text-align:center;font-family:monospace;">
-                <label class="login-label" style="margin-top:4px;">NOVA SENHA</label>
-                <div style="position:relative;">
-                    <input class="login-input" type="password" id="rec-nova-senha" placeholder="Mínimo 6 caracteres" style="padding-right:44px;">
-                    <button onclick="toggleSenhaVis('rec-nova-senha',this)" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:1.1rem;">👁</button>
-                </div>
-                <label class="login-label">CONFIRMAR NOVA SENHA</label>
-                <input class="login-input" type="password" id="rec-nova-senha2" placeholder="Repita a senha"
-                    onkeydown="if(event.key==='Enter')confirmarRecuperacao()">
-                <button class="login-btn" onclick="confirmarRecuperacao()" style="background:#27ae60;">✅ REDEFINIR SENHA</button>
-                <button class="login-btn" onclick="gerarCodigoRecuperacao()" style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);margin-top:8px;font-size:0.82rem;">🔄 Gerar novo código</button>
-            </div>
-            <div class="login-toggle" style="margin-top:14px;">
-                <span onclick="mostrarLogin()">← Voltar ao login</span>
-            </div>
         </div><!-- /recuperacao-form -->
+    </div><!-- /login-card -->
     </div><!-- /login-card -->
     <div style="margin-top:20px; color:rgba(255,255,255,0.25); font-size:0.72rem;">by Will Martins · v18.0 — render modular</div>
 </div>
@@ -4066,7 +4039,46 @@ function fazerLogout(){
 }
 
 function voltarParaLogin(){ fazerLogout(); }
+function toggleUserMenu(){
+    const menu = document.getElementById('user-menu');
+    menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+}
+
 function fecharUserMenu(){ document.getElementById('user-menu').style.display='none'; }
+
+// Fecha menu ao clicar fora
+document.addEventListener('click', function(e){
+    const menu   = document.getElementById('user-menu');
+    const avatar = document.getElementById('user-avatar');
+    if(menu && avatar && !menu.contains(e.target) && !avatar.contains(e.target)){
+        menu.style.display = 'none';
+    }
+});
+
+function mostrarRecuperacao(){
+    document.getElementById('login-form').style.display     = 'none';
+    document.getElementById('cadastro-form').style.display  = 'none';
+    document.getElementById('recuperacao-form').style.display = 'block';
+    document.getElementById('login-error').style.display    = 'none';
+    document.getElementById('rec-passo1').style.display     = 'block';
+    document.getElementById('rec-passo2').style.display     = 'none';
+    const emailInput = document.getElementById('rec-email');
+    if(emailInput) emailInput.value = '';
+}
+
+function mostrarLogin(){
+    document.getElementById('cadastro-form').style.display    = 'none';
+    document.getElementById('recuperacao-form').style.display = 'none';
+    document.getElementById('login-form').style.display       = 'block';
+    document.getElementById('login-error').style.display      = 'none';
+}
+
+function mostrarCadastro(){
+    document.getElementById('login-form').style.display       = 'none';
+    document.getElementById('recuperacao-form').style.display = 'none';
+    document.getElementById('cadastro-form').style.display    = 'block';
+    document.getElementById('login-error').style.display      = 'none';
+}
 
 // ─── FIREBASE: RECUPERAÇÃO DE SENHA ───
 function gerarCodigoRecuperacao(){
