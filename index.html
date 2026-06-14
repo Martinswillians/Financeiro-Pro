@@ -3970,24 +3970,51 @@ function fazerLogin(){
     const email = document.getElementById('l-email').value.trim().toLowerCase();
     const senha  = document.getElementById('l-senha').value.trim();
     const err    = document.getElementById('login-error');
+    const btn    = document.querySelector('.login-btn');
+
+    // Reset error
+    err.style.cssText = '';
     err.style.display = 'none';
-    if(!email||!senha){ err.innerText='Preencha e-mail e senha.'; err.style.display='block'; return; }
+
+    if(!email||!senha){
+        err.style.display='block';
+        err.innerText='Preencha e-mail e senha.';
+        return;
+    }
+
+    // Loading state
+    err.style.display='block';
     err.style.cssText='display:block;background:rgba(52,152,219,0.2);border:1px solid rgba(52,152,219,0.4);color:#aed6f1;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
-    err.innerText = '⏳ Autenticando...';
+    err.innerText='⏳ Autenticando...';
+    if(btn) btn.disabled = true;
+
+    // Timeout de segurança (15s)
+    const timeout = setTimeout(()=>{
+        err.style.cssText='display:block;background:rgba(231,76,60,0.2);border:1px solid rgba(231,76,60,0.4);color:#f1948a;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+        err.innerText='⌛ Tempo esgotado. Verifique sua conexão e tente novamente.';
+        if(btn) btn.disabled = false;
+    }, 15000);
+
     _auth.signInWithEmailAndPassword(email, senha)
-        .then(() => { err.style.display='none'; })
+        .then(() => {
+            clearTimeout(timeout);
+            err.style.display='none';
+            if(btn) btn.disabled = false;
+        })
         .catch(e => {
+            clearTimeout(timeout);
+            if(btn) btn.disabled = false;
             const msgs = {
                 'auth/user-not-found':         'E-mail não encontrado.',
                 'auth/wrong-password':         'Senha incorreta.',
                 'auth/invalid-email':          'E-mail inválido.',
                 'auth/invalid-credential':     'E-mail ou senha incorretos.',
-                'auth/too-many-requests':      'Muitas tentativas. Use "Esqueceu a senha?" para redefinir.',
-                'auth/network-request-failed': 'Sem conexão. Verifique a internet.',
+                'auth/too-many-requests':      '⚠️ Muitas tentativas. Use "Esqueceu a senha?" para redefinir.',
+                'auth/network-request-failed': '📶 Sem conexão. Verifique a internet.',
                 'auth/user-disabled':          'Conta desativada.'
             };
             err.style.cssText='display:block;background:rgba(231,76,60,0.2);border:1px solid rgba(231,76,60,0.4);color:#f1948a;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
-            err.innerText = (msgs[e.code] || e.message) + ' ['+e.code+']';
+            err.innerText = msgs[e.code] || ('Erro: ' + e.message);
         });
 }
 
@@ -4056,12 +4083,10 @@ document.addEventListener('click', function(e){
 });
 
 function mostrarRecuperacao(){
-    document.getElementById('login-form').style.display     = 'none';
-    document.getElementById('cadastro-form').style.display  = 'none';
+    document.getElementById('login-form').style.display      = 'none';
+    document.getElementById('cadastro-form').style.display   = 'none';
     document.getElementById('recuperacao-form').style.display = 'block';
-    document.getElementById('login-error').style.display    = 'none';
-    document.getElementById('rec-passo1').style.display     = 'block';
-    document.getElementById('rec-passo2').style.display     = 'none';
+    document.getElementById('login-error').style.display     = 'none';
     const emailInput = document.getElementById('rec-email');
     if(emailInput) emailInput.value = '';
 }
@@ -4082,23 +4107,35 @@ function mostrarCadastro(){
 
 // ─── FIREBASE: RECUPERAÇÃO DE SENHA ───
 function gerarCodigoRecuperacao(){
-    const email = document.getElementById('rec-email').value.trim();
+    const email = document.getElementById('rec-email').value.trim().toLowerCase();
     const err   = document.getElementById('login-error');
-    err.style.display = 'none';
-    if(!email||!email.includes('@')){ err.innerText='E-mail inválido.'; err.style.display='block'; return; }
+
+    if(!email||!email.includes('@')){
+        err.style.cssText='display:block;background:rgba(231,76,60,0.2);border:1px solid rgba(231,76,60,0.4);color:#f1948a;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+        err.innerText='Informe um e-mail válido.';
+        return;
+    }
+
+    err.style.cssText='display:block;background:rgba(52,152,219,0.2);border:1px solid rgba(52,152,219,0.4);color:#aed6f1;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+    err.innerText='⏳ Enviando e-mail...';
+
     _auth.sendPasswordResetEmail(email)
         .then(() => {
             mostrarLogin();
             setTimeout(() => {
                 const el = document.getElementById('login-error');
                 el.style.cssText = 'display:block;background:rgba(39,174,96,0.2);border:1px solid rgba(39,174,96,0.4);color:#a9dfbf;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
-                el.innerText = '✅ E-mail de redefinição enviado! Verifique sua caixa de entrada.';
+                el.innerText = '✅ Link enviado! Verifique seu e-mail ' + email + ' (incluindo spam).';
             }, 50);
         })
         .catch(e => {
-            const msgs = { 'auth/user-not-found':'Nenhuma conta com este e-mail.', 'auth/invalid-email':'E-mail inválido.' };
-            err.innerText = msgs[e.code] || 'Erro: ' + e.message;
-            err.style.display = 'block';
+            const msgs = {
+                'auth/user-not-found': 'Nenhuma conta encontrada com este e-mail.',
+                'auth/invalid-email':  'E-mail inválido.',
+                'auth/too-many-requests': 'Muitas tentativas. Tente mais tarde.'
+            };
+            err.style.cssText='display:block;background:rgba(231,76,60,0.2);border:1px solid rgba(231,76,60,0.4);color:#f1948a;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+            err.innerText = msgs[e.code] || ('Erro: ' + e.message);
         });
 }
 
