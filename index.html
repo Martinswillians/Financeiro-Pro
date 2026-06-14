@@ -3994,24 +3994,27 @@ function entrarComoVisitante(){
 
 // ─── FIREBASE: LOGIN ───
 function fazerLogin(){
-    const email = document.getElementById('l-email').value.trim();
-    const senha  = document.getElementById('l-senha').value;
+    const email = document.getElementById('l-email').value.trim().toLowerCase();
+    const senha  = document.getElementById('l-senha').value.trim();
     const err    = document.getElementById('login-error');
     err.style.display = 'none';
     if(!email||!senha){ err.innerText='Preencha e-mail e senha.'; err.style.display='block'; return; }
-    err.innerText = '⏳ Autenticando...'; err.style.display='block';
+    err.style.cssText='display:block;background:rgba(52,152,219,0.2);border:1px solid rgba(52,152,219,0.4);color:#aed6f1;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+    err.innerText = '⏳ Autenticando...';
     _auth.signInWithEmailAndPassword(email, senha)
         .then(() => { err.style.display='none'; })
         .catch(e => {
             const msgs = {
-                'auth/user-not-found':    'E-mail não encontrado.',
-                'auth/wrong-password':    'Senha incorreta.',
-                'auth/invalid-email':     'E-mail inválido.',
-                'auth/invalid-credential':'E-mail ou senha incorretos.',
-                'auth/too-many-requests': 'Muitas tentativas. Tente mais tarde.'
+                'auth/user-not-found':         'E-mail não encontrado.',
+                'auth/wrong-password':         'Senha incorreta.',
+                'auth/invalid-email':          'E-mail inválido.',
+                'auth/invalid-credential':     'E-mail ou senha incorretos.',
+                'auth/too-many-requests':      'Muitas tentativas. Use "Esqueceu a senha?" para redefinir.',
+                'auth/network-request-failed': 'Sem conexão. Verifique a internet.',
+                'auth/user-disabled':          'Conta desativada.'
             };
-            err.innerText = msgs[e.code] || 'Erro: ' + e.message;
-            err.style.display = 'block';
+            err.style.cssText='display:block;background:rgba(231,76,60,0.2);border:1px solid rgba(231,76,60,0.4);color:#f1948a;border-radius:8px;padding:10px 12px;font-size:0.82rem;margin-bottom:12px;';
+            err.innerText = (msgs[e.code] || e.message) + ' ['+e.code+']';
         });
 }
 
