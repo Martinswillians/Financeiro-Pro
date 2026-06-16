@@ -1406,7 +1406,7 @@ function salvarRecorrente(){
     }
     render();
 }
-function excluirRecorrente(id){ if(confirm('Excluir?')){ recorrentes=recorrentes.filter(i=>i.id!==id); saveAll(); renderRecorrentes(); } }
+function excluirRecorrente(id){ _confirmarExclusao('Excluir esta recorrente?', function(){ recorrentes=recorrentes.filter(i=>i.id!==id); saveAll(); renderRecorrentes(); }); }
 function renderRecorrentes(){
     const el = document.getElementById('lista-recorrentes');
     if(!el) return;
@@ -2734,6 +2734,10 @@ function abrirDrill(cat,tipo,periodo){
 //  LANÇAMENTOS
 // =====================================================
 function salvarLancamento(){
+    // Previne duplo clique
+    const btnSalvar = document.querySelector('#modalRegistro button[onclick="salvarLancamento()"]');
+    if(btnSalvar){ btnSalvar.disabled = true; setTimeout(()=>{ btnSalvar.disabled=false; }, 3000); }
+
     const idEx      = document.getElementById('f-id').value;
     const tipo      = document.getElementById('f-tipo').value;
     const parcelado = document.getElementById('f-parcelado').checked;
@@ -3015,7 +3019,37 @@ function excluirLanc(id){
         document.getElementById('modalRepeticaoAcao').style.display = 'flex';
         return;
     }
-    if(confirm('Excluir este lançamento?')){ bd = bd.filter(i => i.id !== id); saveAll(); render(); }
+    _confirmarExclusao('Excluir este lançamento?', function(){ bd = bd.filter(i => i.id !== id); saveAll(); render(); });
+}
+
+function _confirmarExclusao(msg, callback){
+    // Usa confirm nativo, com fallback para modal customizado em mobile
+    try {
+        if(window.confirm(msg)){ callback(); }
+    } catch(e) {
+        // Fallback: modal customizado
+        if(!document.getElementById('modal-confirmar-excl')){
+            const div = document.createElement('div');
+            div.id = 'modal-confirmar-excl';
+            div.style.cssText = 'display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;';
+            div.innerHTML = `<div style="background:var(--card-bg);border-radius:16px;padding:24px;max-width:300px;margin:20px;text-align:center;">
+                <div id="modal-excl-msg" style="font-size:0.9rem;margin-bottom:20px;color:var(--text);"></div>
+                <div style="display:flex;gap:10px;justify-content:center;">
+                    <button onclick="document.getElementById('modal-confirmar-excl').style.display='none'" 
+                        style="flex:1;padding:10px;border:1px solid var(--border);background:var(--surface);border-radius:8px;cursor:pointer;color:var(--text);">Cancelar</button>
+                    <button id="modal-excl-btn" 
+                        style="flex:1;padding:10px;background:#e74c3c;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:bold;">Excluir</button>
+                </div>
+            </div>`;
+            document.body.appendChild(div);
+        }
+        document.getElementById('modal-excl-msg').innerText = msg;
+        document.getElementById('modal-excl-btn').onclick = function(){
+            document.getElementById('modal-confirmar-excl').style.display='none';
+            callback();
+        };
+        document.getElementById('modal-confirmar-excl').style.display='flex';
+    }
 }
 
 function executarAcaoRepeticao(escopo){
@@ -3106,7 +3140,7 @@ function editarMeta(id){
     document.getElementById('fm-valor').value=fmt(m.limite).replace('R$','').trim();
     document.getElementById('modalMeta').style.display='flex';
 }
-function excluirMeta(id){ if(confirm("Excluir?")){ metas=metas.filter(i=>i.id!==id); saveAll(); render(); } }
+function excluirMeta(id){ _confirmarExclusao('Excluir esta meta?', function(){ metas=metas.filter(i=>i.id!==id); saveAll(); render(); }); }
 
 // =====================================================
 //  METAS DE INVESTIMENTO
@@ -3205,7 +3239,7 @@ function salvarMetaInv(){
 }
 
 function excluirMetaInv(id){
-    if(confirm('Excluir esta meta?')){ metasInv=metasInv.filter(i=>i.id!==id); saveAll(); renderMetasInv(); }
+    _confirmarExclusao('Excluir esta meta?', function(){ metasInv=metasInv.filter(i=>i.id!==id); saveAll(); renderMetasInv(); });
 }
 
 // Calcula o patrimônio atual total de investimentos
@@ -3684,7 +3718,7 @@ function editarInvestimento(id){
     document.getElementById('inv-modal-titulo').innerText='✏️ Editar Ativo'; document.getElementById('fi-id').value=i.id; document.getElementById('fi-classe').value=i.classe; document.getElementById('fi-nome').value=i.nome; document.getElementById('fi-data').value=i.data; document.getElementById('fi-aportado').value=fmt(i.aportado).replace('R$','').trim(); document.getElementById('fi-atual').value=fmt(i.atual).replace('R$','').trim(); document.getElementById('fi-obs').value=i.obs||''; document.getElementById('fi-tipo-aporte').value=i.tipoAporte||'Aporte de Receita'; toggleAvisoReceita(); calcRentInv();
     document.getElementById('modalInvestimento').style.display='flex';
 }
-function excluirInvestimento(id){ if(confirm('Excluir?')){ investimentos=investimentos.filter(i=>i.id!==id); saveAll(); render(); } }
+function excluirInvestimento(id){ _confirmarExclusao('Excluir este investimento?', function(){ investimentos=investimentos.filter(i=>i.id!==id); saveAll(); render(); }); }
 function salvarInvestimento(){
     const idEx=document.getElementById('fi-id').value;
     const d={id:idEx?parseInt(idEx):Date.now(),classe:document.getElementById('fi-classe').value,nome:document.getElementById('fi-nome').value.trim(),data:document.getElementById('fi-data').value,aportado:parseMoeda(document.getElementById('fi-aportado').value),atual:parseMoeda(document.getElementById('fi-atual').value),obs:document.getElementById('fi-obs').value.trim(),tipoAporte:document.getElementById('fi-tipo-aporte').value};
