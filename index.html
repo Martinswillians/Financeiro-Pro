@@ -308,7 +308,7 @@
                 <select id="filtro-ano" onchange="sincFiltroAnoMes()" class="filtro-sel"></select>
             </div>
             <!-- Campo oculto mantido para compatibilidade com render() -->
-            <select id="filtro-periodo" style="display:none;" onchange="render()"></select>
+            <input type="hidden" id="filtro-periodo" value="">
         </div>
         <button class="notif-bell" id="btn-notif" onclick="toggleNotifPanel()" title="Notificações">🔔<span class="notif-badge" id="notif-count" style="display:none;">0</span></button>
         <span id="visitor-badge" style="display:none;background:#e67e22;color:white;font-size:0.58rem;font-weight:800;padding:2px 7px;border-radius:10px;letter-spacing:0.5px;">VISITANTE</span>
@@ -2337,6 +2337,7 @@ function sincFiltroAnoMes(){
     const ano = document.getElementById('filtro-ano')?.value || '';
     const fp  = document.getElementById('filtro-periodo');
     if(fp) fp.value = ano + '-' + mes;
+    render();
 }
 
 function togglePainelFiltrosExt(){
@@ -2736,9 +2737,10 @@ function abrirDrill(cat,tipo,periodo){
 function salvarLancamento(){
     // Previne duplo clique
     const btnSalvar = document.querySelector('#modalRegistro button[onclick="salvarLancamento()"]');
-    if(btnSalvar){ btnSalvar.disabled = true; setTimeout(()=>{ btnSalvar.disabled=false; }, 3000); }
+    if(btnSalvar && btnSalvar.disabled) return; // já está processando
+    if(btnSalvar) btnSalvar.disabled = true;
 
-    const idEx      = document.getElementById('f-id').value;
+    const idEx = document.getElementById('f-id').value;
     const tipo      = document.getElementById('f-tipo').value;
     const parcelado = document.getElementById('f-parcelado').checked;
     const repetir   = document.getElementById('f-repetir').checked;
@@ -2783,7 +2785,7 @@ function salvarLancamento(){
         const entrada = {...base, id:Date.now()+1, tipo:'Receita', cat:'Transferência', desc:`Transferência ← ${contaNome(parseInt(base.conta))}`, conta:parseInt(contaDest)};
         bd.push(saida, entrada);
         window._recriarParcelasFuturas = false;
-        saveAll(); fecharModal('modalRegistro'); initFiltro(); render();
+        _fecharModalRegistro(); saveAll(); initFiltro(); render();
         mostrarToast('↔️ Transferência registrada!','success',3500);
         return;
     }
@@ -2816,7 +2818,7 @@ function salvarLancamento(){
         window._parcelaDataRef=null; window._dadosParcelaEdicao=null;
         window._totalParcelasGrupo=0; window._parcelasPassadas=0;
         _parcelaFuturaGrupo=null; _parcelaFuturaData=null;
-        saveAll(); fecharModal('modalRegistro'); initFiltro(); render();
+        _fecharModalRegistro(); saveAll(); initFiltro(); render();
         mostrarToast('✅ Parcelas futuras atualizadas.','success',4000);
         return;
     }
@@ -2861,7 +2863,7 @@ function salvarLancamento(){
 
     window._recriarParcelasFuturas = false;
     removerComprovante();
-    saveAll(); fecharModal('modalRegistro'); initFiltro(); render();
+    _fecharModalRegistro(); saveAll(); initFiltro(); render();
 }
 // =====================================================
 //  AÇÃO EM PARCELAMENTO — estado temporário
@@ -3491,6 +3493,15 @@ function abrirModalMeta(){
     document.getElementById('modalMeta').style.display='flex';
 }
 function fecharModal(id){ document.getElementById(id).style.display='none'; }
+
+function _fecharModalRegistro(){
+    const modal   = document.getElementById('modalRegistro');
+    const btnSalvar = document.querySelector('#modalRegistro button[onclick="salvarLancamento()"]');
+    if(modal)    modal.style.display = 'none';
+    if(btnSalvar) btnSalvar.disabled = false;
+    // Limpa comprovante
+    removerComprovante();
+}
 function loadCats(){
     const t = document.getElementById('f-tipo').value;
     const sel = document.getElementById('f-cat');
@@ -3914,21 +3925,40 @@ function importarBackup(input){
         try {
             const backup = JSON.parse(e.target.result);
             let dados = null;
+
+            // Formato v40 migração (múltiplos usuários)
             if(backup.versao === 'v40_migracao' && backup.usuarios){
-                dados = backup.usuarios.reduce((a,b)=>(b.dados?.bd?.length||0)>(a.dados?.bd?.length||0)?b:a).dados;
-            } else if(backup.bd||backup.metas){
+                dados = backup.usuarios.reduce((a,b)=>
+                    (b.dados?.bd?.length||0) > (a.dados?.bd?.length||0) ? b : a
+                ).dados;
+
+            // Formato v38/v37/v36 — backup direto (bd, metas, contas etc no raiz)
+            } else if(backup.bd && Array.isArray(backup.bd)){
                 dados = backup;
+
+            // Formato antigo com wrapper {dados: {...}}
+            } else if(backup.dados && backup.dados.bd){
+                dados = backup.dados;
+
             } else {
-                mostrarToast('❌ Formato inválido.','warn',3000); return;
+                mostrarToast('❌ Formato de backup não reconhecido.','warn',4000);
+                return;
             }
+
             if(dados){
-                bd=dados.bd||[]; metas=dados.metas||[]; cats=dados.cats||cats;
-                investimentos=dados.investimentos||[]; recorrentes=dados.recorrentes||[];
-                contas=dados.contas||contas; metasInv=dados.metasInv||[];
+                bd            = Array.isArray(dados.bd)            ? dados.bd            : [];
+                metas         = Array.isArray(dados.metas)         ? dados.metas         : [];
+                investimentos = Array.isArray(dados.investimentos)  ? dados.investimentos : [];
+                recorrentes   = Array.isArray(dados.recorrentes)    ? dados.recorrentes   : [];
+                metasInv      = Array.isArray(dados.metasInv)       ? dados.metasInv      : [];
+                if(dados.cats && typeof dados.cats === 'object') cats = dados.cats;
+                if(dados.contas && Array.isArray(dados.contas) && dados.contas.length > 0) contas = dados.contas;
                 saveAll(); initFiltro(); render();
-                mostrarToast('✅ Backup importado: '+bd.length+' lançamentos.','success',4000);
+                mostrarToast(`✅ Backup importado! ${bd.length} lançamentos restaurados.`, 'success', 5000);
             }
-        } catch(err){ mostrarToast('❌ Erro: '+err.message,'warn',3000); }
+        } catch(err){
+            mostrarToast('❌ Erro ao ler backup: ' + err.message, 'warn', 4000);
+        }
     };
     reader.readAsText(file);
 }
