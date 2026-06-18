@@ -2330,14 +2330,15 @@ function initFiltro(){
     if(!anoEl || !mesEl) return;
     const hoje     = new Date();
     const anoAtual = hoje.getFullYear();
+    const mesAtual = String(hoje.getMonth()+1).padStart(2,'0');
     const anos     = [];
     for(let a = anoAtual - 5; a <= anoAtual + 2; a++) anos.push(a);
-    const anoSel = anoEl.value || String(anoAtual);
     anoEl.innerHTML = anos.map(a =>
-        `<option value="${a}" ${String(a)===anoSel?'selected':''}>${a}</option>`
+        `<option value="${a}" ${a===anoAtual?'selected':''}>${a}</option>`
     ).join('');
-    if(!mesEl.value) mesEl.value = String(hoje.getMonth()+1).padStart(2,'0');
-    if(!anoEl.value) anoEl.value = String(anoAtual);
+    // Sempre força mês e ano atuais ao inicializar
+    mesEl.value = mesAtual;
+    anoEl.value = String(anoAtual);
     sincFiltroAnoMes();
 }
 
