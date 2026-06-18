@@ -732,9 +732,13 @@
             <button onclick="exportarDados()" style="width:100%;padding:13px;background:var(--primary);color:white;border:none;border-radius:8px;font-weight:bold;margin-bottom:10px;">📦 Exportar Backup JSON</button>
             <button onclick="exportarCSV()" style="width:100%;padding:13px;background:#27ae60;color:white;border:none;border-radius:8px;font-weight:bold;margin-bottom:10px;">📊 Exportar CSV (Excel)</button>
             <button onclick="exportarPDF()" style="width:100%;padding:13px;background:#e74c3c;color:white;border:none;border-radius:8px;font-weight:bold;margin-bottom:10px;">📄 Exportar Resumo PDF</button>
-            <label style="width:100%;padding:13px;background:var(--secondary);color:white;border:none;border-radius:8px;font-weight:bold;display:block;text-align:center;cursor:pointer;">
-                📥 Importar Backup <input type="file" hidden onchange="importarDados(event)">
-            </label>
+            <button onclick="document.getElementById('import-backup-input').click()"
+                style="width:100%;padding:13px;background:var(--secondary);color:white;border:none;border-radius:8px;font-weight:bold;margin-bottom:10px;cursor:pointer;">
+                📥 Importar Backup JSON
+            </button>
+            <input type="file" id="import-backup-input" accept=".json"
+                style="display:none;position:absolute;opacity:0;"
+                onchange="importarBackup(this)">
         </div>
     </div>
 
@@ -815,8 +819,13 @@
             <h3 style="margin:8px 0 4px;">Importar seus dados</h3>
             <p style="font-size:0.82rem;color:var(--muted);">Selecione o arquivo de backup que você baixou.</p>
         </div>
+        <button onclick="document.getElementById('migr-import-file').click()"
+            style="width:100%;padding:13px;background:var(--primary);color:white;border:none;border-radius:8px;font-weight:bold;margin-bottom:10px;cursor:pointer;">
+            📂 Selecionar arquivo de backup
+        </button>
         <input type="file" id="migr-import-file" accept=".json"
-            style="margin-bottom:12px;" onchange="migracaoImportar(this)">
+            style="display:none;position:absolute;opacity:0;"
+            onchange="migracaoImportar(this)">
         <button onclick="fecharModal('modalImportarMigracao')"
             style="width:100%;background:none;border:none;color:var(--muted);padding:10px;cursor:pointer;">
             Pular — começar do zero
@@ -3789,25 +3798,9 @@ function exportarPDF(){
     const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=`resumo_${pSel}.html`; a.click();
 }
 
+// importarDados mantido por compatibilidade — redireciona para importarBackup
 function importarDados(event){
-    const file=event.target.files[0]; if(!file) return;
-    const reader=new FileReader();
-    reader.onload=(e)=>{
-        try{
-            const data=JSON.parse(e.target.result);
-            if(data.bd&&data.metas&&data.cats){
-                if(confirm("Substituir todos os dados atuais?")){
-                    bd=data.bd; metas=data.metas; cats=data.cats;
-                    if(data.investimentos) investimentos=data.investimentos;
-                    if(data.recorrentes)   recorrentes=data.recorrentes;
-                    if(data.contas)        contas=data.contas;
-                    if(data.metasInv)      metasInv=data.metasInv;
-                    saveAll(); initFiltro(); render(); alert("Backup importado!");
-                }
-            } else alert("Arquivo inválido.");
-        } catch(err){ alert("Erro ao ler arquivo."); }
-    };
-    reader.readAsText(file); event.target.value="";
+    importarBackup(event.target);
 }
 
 // =====================================================
@@ -3873,48 +3866,8 @@ function migracaoIgnorar(){
 }
 
 function migracaoImportar(input){
-    const file = input.files[0]; if(!file) return;
-    const reader = new FileReader();
-    reader.onload = function(e){
-        try {
-            const backup = JSON.parse(e.target.result);
-            let dados = null;
-
-            // Formato v40 (migração com múltiplos usuários)
-            if(backup.versao === 'v40_migracao' && backup.usuarios){
-                // Importa o primeiro usuário ou o que tem mais dados
-                const melhor = backup.usuarios.reduce((a,b) =>
-                    (b.dados?.bd?.length||0) > (a.dados?.bd?.length||0) ? b : a
-                );
-                dados = melhor.dados;
-                if(melhor.foto && usuarioAtual) _salvarFoto(usuarioAtual.id, melhor.foto);
-
-            // Formato backup padrão (exportação das configurações)
-            } else if(backup.bd || backup.metas){
-                dados = backup;
-            } else {
-                mostrarToast('❌ Formato de backup não reconhecido.','warn',4000);
-                return;
-            }
-
-            if(dados){
-                bd            = dados.bd            || [];
-                metas         = dados.metas         || [];
-                cats          = dados.cats          || cats;
-                investimentos = dados.investimentos || [];
-                recorrentes   = dados.recorrentes   || [];
-                contas        = dados.contas        || contas;
-                metasInv      = dados.metasInv      || [];
-                saveAll();
-                fecharModal('modalImportarMigracao');
-                initFiltro(); render();
-                mostrarToast(`✅ ${bd.length} lançamentos importados com sucesso!`,'success',5000);
-            }
-        } catch(err){
-            mostrarToast('❌ Erro ao ler backup: '+err.message,'warn',4000);
-        }
-    };
-    reader.readAsText(file);
+    // Reutiliza a mesma lógica robusta do importarBackup
+    importarBackup(input);
 }
 
 // Atualiza importação do Config para aceitar backup v40
