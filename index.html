@@ -80,10 +80,12 @@
             transition: background 0.3s, color 0.3s;
         }
 
-        .mobile-header { background: var(--header-bg); color: white; padding: 12px 15px; display: flex; justify-content: space-between; align-items: center; z-index: 100; box-shadow: 0 2px 5px rgba(0,0,0,0.15); gap:8px; position:relative; overflow:hidden; }
+        .mobile-header { background: var(--header-bg); color: white; padding: 12px 15px; display: flex; justify-content: space-between; align-items: center; z-index: 100; box-shadow: 0 2px 5px rgba(0,0,0,0.15); gap:8px; position:relative; overflow:visible; }
+        /* Canvas de partículas confinado ao header sem clip dos filhos */
+        #particles-canvas { overflow:hidden; border-radius:0; }
         .brand-mobile { display: flex; align-items: center; gap: 8px; flex-shrink:0; }
         .logo-container { width: 32px; height: 32px; background: var(--secondary); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; }
-        .header-controls { display:flex; align-items:center; gap:8px; }
+        .header-controls { display:flex; align-items:center; gap:8px; overflow:visible; }
 
         .main-container { flex: 1; overflow-y: auto; padding: 15px; padding-bottom: calc(95px + env(safe-area-inset-bottom)); }
         .page { display: none; }
@@ -3961,10 +3963,56 @@ let _modoVisitante = false;
 function _primeiraLetra(nome){ return (nome||'U')[0].toUpperCase(); }
 function _primeiroNome(nome){ return (nome||'').split(' ')[0]; }
 
-// ─── FOTO DE PERFIL (mantida em localStorage como base64) ───
-function _getFoto(uid){ return localStorage.getItem(`will_foto_${uid}`) || null; }
-function _salvarFoto(uid, b64){ localStorage.setItem(`will_foto_${uid}`, b64); }
-function _removerFotoStorage(uid){ localStorage.removeItem(`will_foto_${uid}`); }
+// ─── FOTO DE PERFIL (salva no Firestore como base64) ───
+// Cache em memória para evitar re-leitura frequente
+let _fotoCache = {};
+
+function _getFoto(uid){ return _fotoCache[uid] || null; }
+
+function _salvarFoto(uid, b64){
+    _fotoCache[uid] = b64;
+    // Persiste no Firestore no documento de perfil do usuário
+    _db.collection('usuarios').doc(uid).set({ foto: b64 }, { merge: true })
+        .catch(() => {
+            // Fallback: tenta localStorage se Firestore falhar (offline)
+            try { localStorage.setItem(`will_foto_${uid}`, b64); } catch(e){}
+        });
+}
+
+function _removerFotoStorage(uid){
+    _fotoCache[uid] = null;
+    _db.collection('usuarios').doc(uid).set({ foto: '' }, { merge: true })
+        .catch(() => { try { localStorage.removeItem(`will_foto_${uid}`); } catch(e){} });
+}
+
+// Carrega foto do Firestore e popula o cache
+function _carregarFotoUsuario(uid){
+    // Tenta cache localStorage como fallback rápido enquanto carrega do Firestore
+    const localFoto = localStorage.getItem(`will_foto_${uid}`);
+    if(localFoto) _fotoCache[uid] = localFoto;
+
+    _db.collection('usuarios').doc(uid).get()
+        .then(doc => {
+            if(doc.exists && doc.data().foto){
+                _fotoCache[uid] = doc.data().foto;
+                // Migra para Firestore se só estava no localStorage
+                if(localFoto && !doc.data().foto){
+                    _db.collection('usuarios').doc(uid).set({ foto: localFoto }, { merge: true }).catch(()=>{});
+                }
+            } else if(localFoto){
+                // Migra foto do localStorage para Firestore
+                _fotoCache[uid] = localFoto;
+                _db.collection('usuarios').doc(uid).set({ foto: localFoto }, { merge: true })
+                    .then(() => localStorage.removeItem(`will_foto_${uid}`))
+                    .catch(()=>{});
+            }
+            _atualizarHeaderUsuario();
+        })
+        .catch(() => {
+            // Offline: usa cache já carregado acima
+            _atualizarHeaderUsuario();
+        });
+}
 
 function _renderAvatar(el, user){
     if(!el) return;
@@ -4240,14 +4288,19 @@ function salvarPerfil(){
     if(s1&&s1!==s2){ mostrarToast('Senhas não coincidem.','warn',3000); return; }
     const prev     = document.getElementById('perfil-foto-preview');
     const novaFoto = prev.dataset.novaFoto;
-    if(novaFoto === '') _removerFotoStorage(usuarioAtual.id);
-    else if(novaFoto)   _salvarFoto(usuarioAtual.id, novaFoto);
+    if(novaFoto === ''){
+        _removerFotoStorage(usuarioAtual.id);
+        _fotoCache[usuarioAtual.id] = null;
+    } else if(novaFoto){
+        _fotoCache[usuarioAtual.id] = novaFoto;
+        _salvarFoto(usuarioAtual.id, novaFoto);
+    }
     // Atualiza nome no Firestore
     _db.collection('usuarios').doc(usuarioAtual.id).set({ nome }, { merge: true });
     usuarioAtual.nome = nome;
     // Atualiza senha no Firebase Auth
     if(s1) _auth.currentUser.updatePassword(s1).catch(e=>mostrarToast('Erro ao alterar senha: '+e.message,'warn',4000));
-    _atualizarHeaderUsuario();
+    _atualizarHeaderUsuario(); // Reflete nova foto e nome imediatamente no header
     fecharModal('modalPerfil');
     mostrarToast('✅ Perfil atualizado!','success',3000);
 }
@@ -4283,52 +4336,61 @@ function _atualizarHeaderUsuario(){
         : `${periodo}, ${_primeiroNome(usuarioAtual.nome)}!`;
 }
 
-// ─── FIREBASE: CARREGAR DADOS (Firestore) ───
+// ─── FIREBASE: CARREGAR DADOS (Firestore como fonte única de verdade) ───
 function _carregarDadosUsuario(uid){
-    const cached = localStorage.getItem(`will_dados_${uid}`);
-    if(cached){
-        const d = JSON.parse(cached);
-        bd=[...d.bd||[]]; metas=[...d.metas||[]];
-        cats=d.cats||{Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],Receita:['Salário','Freelance','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Restituição IRPF']};
-        investimentos=[...d.investimentos||[]]; recorrentes=[...d.recorrentes||[]];
-        contas=d.contas||[{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
-        metasInv=[...d.metasInv||[]];
-        initFiltro(); render();
-    }
-    // Carrega do Firestore e sincroniza — mas só sobrescreve se Firestore tiver MAIS dados
+    const CATS_PADRAO = {
+        Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],
+        Receita:['Salário','Freelance','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Restituição IRPF']
+    };
+    const CONTAS_PADRAO = [{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
+
+    // Carrega do Firestore (fonte de verdade)
     _db.collection('usuarios').doc(uid).collection('dados').doc('financeiro').get()
         .then(doc => {
             if(doc.exists){
                 const d = doc.data();
-                const bdFirestore    = d.bd || [];
-                const bdLocal        = bd;
-                // Usa Firestore se tiver mais lançamentos ou se não tinha cache local
-                if(bdFirestore.length >= bdLocal.length || !cached){
-                    bd            = bdFirestore;
-                    metas         = d.metas         || metas;
-                    cats          = d.cats          || cats;
-                    investimentos = d.investimentos || investimentos;
-                    recorrentes   = d.recorrentes   || recorrentes;
-                    contas        = d.contas        || contas;
-                    metasInv      = d.metasInv      || metasInv;
-                    // Atualiza cache local com dados do Firestore
-                    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
-                    initFiltro(); render();
-                }
-                // Se local tem mais dados (ex: acabou de importar backup), envia para Firestore
-                else if(bdLocal.length > bdFirestore.length){
-                    const dadosSalvar = {bd:bdLocal, metas, cats, investimentos, recorrentes, contas, metasInv};
-                    _db.collection('usuarios').doc(uid).collection('dados').doc('financeiro').set(dadosSalvar).catch(()=>{});
-                }
-            } else if(!cached){
-                // Novo usuário sem dados
-                contas = [{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
-                initFiltro(); render();
+                bd            = Array.isArray(d.bd)            ? d.bd            : [];
+                metas         = Array.isArray(d.metas)         ? d.metas         : [];
+                cats          = (d.cats && typeof d.cats === 'object') ? d.cats : CATS_PADRAO;
+                investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
+                recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
+                contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
+                metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
+                // Atualiza cache offline
+                localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+            } else {
+                // Novo usuário: inicia com padrões
+                bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
+                cats   = CATS_PADRAO;
+                contas = CONTAS_PADRAO;
+                // Remove eventual lixo de localStorage de outro usuário
+                localStorage.removeItem(`will_dados_${uid}`);
             }
+            initFiltro(); render();
+            setTimeout(_verificarImportacaoPosMigracao, 2000);
         })
         .catch(() => {
-            // Offline — usa cache local (já carregado acima)
-            if(!cached){ initFiltro(); render(); }
+            // Offline: usa cache local como fallback
+            const cached = localStorage.getItem(`will_dados_${uid}`);
+            if(cached){
+                try {
+                    const d = JSON.parse(cached);
+                    bd            = Array.isArray(d.bd)            ? d.bd            : [];
+                    metas         = Array.isArray(d.metas)         ? d.metas         : [];
+                    cats          = (d.cats && typeof d.cats === 'object') ? d.cats : CATS_PADRAO;
+                    investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
+                    recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
+                    contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
+                    metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
+                    mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
+                } catch(e) {
+                    bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
+                }
+            } else {
+                bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
+                mostrarToast('📶 Sem conexão e sem cache local.', 'warn', 5000);
+            }
+            initFiltro(); render();
         });
 }
 
@@ -4353,25 +4415,24 @@ _auth.onAuthStateChanged(function(firebaseUser){
                 const nome = doc.exists ? (doc.data().nome || firebaseUser.displayName || 'Usuário') : (firebaseUser.displayName || 'Usuário');
                 _modoVisitante = false;
                 usuarioAtual   = { id: firebaseUser.uid, nome, email: firebaseUser.email };
-                _carregarDadosUsuario(firebaseUser.uid);
-                document.getElementById('login-screen').classList.add('hidden');
-                _atualizarHeaderUsuario();
                 _primeiroRender = true;
                 _alertasPeriodo = '';
-                initFiltro();
-                render();
+                document.getElementById('login-screen').classList.add('hidden');
+                _atualizarHeaderUsuario();
                 mostrarToast(`👋 Olá, ${_primeiroNome(nome)}! Bem-vindo(a).`, 'success', 4000);
-                setTimeout(_verificarImportacaoPosMigracao, 2000);
+                // Carrega foto e dados em paralelo; initFiltro+render+_verificarImportacao ficam dentro de _carregarDadosUsuario
+                _carregarFotoUsuario(firebaseUser.uid);
+                _carregarDadosUsuario(firebaseUser.uid);
             })
             .catch(() => {
                 _modoVisitante = false;
                 usuarioAtual   = { id: firebaseUser.uid, nome: firebaseUser.displayName||'Usuário', email: firebaseUser.email };
-                _carregarDadosUsuario(firebaseUser.uid);
-                document.getElementById('login-screen').classList.add('hidden');
-                _atualizarHeaderUsuario();
                 _primeiroRender = true;
                 _alertasPeriodo = '';
-                initFiltro(); render();
+                document.getElementById('login-screen').classList.add('hidden');
+                _atualizarHeaderUsuario();
+                _carregarFotoUsuario(firebaseUser.uid);
+                _carregarDadosUsuario(firebaseUser.uid);
             });
     } else {
         document.getElementById('login-screen').classList.remove('hidden');
