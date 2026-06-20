@@ -3910,20 +3910,16 @@ function importarBackup(input){
                 if(dados.cats   && typeof dados.cats   === 'object') cats   = dados.cats;
                 if(dados.contas && Array.isArray(dados.contas) && dados.contas.length > 0) contas = dados.contas;
 
-                // Salva no Firestore diretamente (não depende de saveAll que pode ser lento)
+                // Salva no Firestore particionado (evita limite de 1MB por documento)
                 if(usuarioAtual && !_modoVisitante){
-                    const uid = usuarioAtual.id;
-                    const dadosSalvar = {bd,metas,cats,investimentos,recorrentes,contas,metasInv};
-                    // 1. Salva localmente
-                    localStorage.setItem(`will_dados_${uid}`, JSON.stringify(dadosSalvar));
-                    // 2. Salva no Firestore com await via promise encadeada
-                    _db.collection('usuarios').doc(uid).collection('dados').doc('financeiro')
-                        .set(dadosSalvar)
+                    mostrarToast('⏳ Salvando na nuvem...', 'info', 3000);
+                    _saveAllPromise()
                         .then(()=>{
                             mostrarToast(`✅ ${bd.length} lançamentos importados e salvos na nuvem!`, 'success', 5000);
                         })
                         .catch(err2=>{
-                            mostrarToast(`⚠️ Importado localmente. Erro nuvem: ${err2.message}`, 'warn', 5000);
+                            // Dados já estão em memória e em cache local; erro apenas na nuvem
+                            mostrarToast(`⚠️ Importado localmente. Erro nuvem: ${err2.message}`, 'warn', 6000);
                         });
                 } else {
                     mostrarToast(`✅ ${bd.length} lançamentos importados!`, 'success', 5000);
@@ -4336,7 +4332,9 @@ function _atualizarHeaderUsuario(){
         : `${periodo}, ${_primeiroNome(usuarioAtual.nome)}!`;
 }
 
-// ─── FIREBASE: CARREGAR DADOS (Firestore como fonte única de verdade) ───
+// ─── FIREBASE: CARREGAR DADOS (Firestore particionado como fonte de verdade) ───
+// Documentos: 'bd', 'metas', 'config', 'investimentos', 'recorrentes'
+// Fallback: documento legado 'financeiro' (formato antigo de 1 doc só)
 function _carregarDadosUsuario(uid){
     const CATS_PADRAO = {
         Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],
@@ -4344,11 +4342,70 @@ function _carregarDadosUsuario(uid){
     };
     const CONTAS_PADRAO = [{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
 
-    // Carrega do Firestore (fonte de verdade)
-    _db.collection('usuarios').doc(uid).collection('dados').doc('financeiro').get()
-        .then(doc => {
-            if(doc.exists){
-                const d = doc.data();
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+
+    // Busca todos os documentos particionados em paralelo
+    Promise.all([
+        base.doc('bd').get(),
+        base.doc('metas').get(),
+        base.doc('config').get(),
+        base.doc('investimentos').get(),
+        base.doc('recorrentes').get(),
+        base.doc('financeiro').get()  // fallback legado
+    ])
+    .then(([docBd, docMetas, docConfig, docInv, docRec, docLegado]) => {
+        // Verifica se existe o formato novo (particionado)
+        const temFormatoNovo = docBd.exists || docMetas.exists || docConfig.exists;
+
+        if(temFormatoNovo){
+            // ── Formato particionado (v42+) ──
+            bd            = docBd.exists    ? (docBd.data().bd            || []) : [];
+            metas         = docMetas.exists ? (docMetas.data().metas       || []) : [];
+            investimentos = docInv.exists   ? (docInv.data().investimentos || []) : [];
+            metasInv      = docInv.exists   ? (docInv.data().metasInv      || []) : [];
+            recorrentes   = docRec.exists   ? (docRec.data().recorrentes   || []) : [];
+            if(docConfig.exists){
+                const cfg = docConfig.data();
+                cats   = (cfg.cats   && typeof cfg.cats === 'object')      ? cfg.cats   : CATS_PADRAO;
+                contas = (Array.isArray(cfg.contas) && cfg.contas.length > 0) ? cfg.contas : CONTAS_PADRAO;
+            } else {
+                cats   = CATS_PADRAO;
+                contas = CONTAS_PADRAO;
+            }
+        } else if(docLegado.exists){
+            // ── Formato legado (1 documento) → migra automaticamente ──
+            const d = docLegado.data();
+            bd            = Array.isArray(d.bd)            ? d.bd            : [];
+            metas         = Array.isArray(d.metas)         ? d.metas         : [];
+            cats          = (d.cats && typeof d.cats === 'object')           ? d.cats   : CATS_PADRAO;
+            investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
+            recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
+            contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
+            metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
+            // Migra automaticamente para formato particionado
+            mostrarToast('🔄 Migrando dados para novo formato...', 'info', 3000);
+            _saveAllPromise()
+                .then(() => base.doc('financeiro').delete().catch(()=>{}))
+                .catch(()=>{});
+        } else {
+            // Novo usuário
+            bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
+            cats   = CATS_PADRAO;
+            contas = CONTAS_PADRAO;
+            localStorage.removeItem(`will_dados_${uid}`);
+        }
+
+        // Atualiza cache offline
+        localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+        initFiltro(); render();
+        setTimeout(_verificarImportacaoPosMigracao, 2000);
+    })
+    .catch(() => {
+        // Offline: usa cache local como fallback
+        const cached = localStorage.getItem(`will_dados_${uid}`);
+        if(cached){
+            try {
+                const d = JSON.parse(cached);
                 bd            = Array.isArray(d.bd)            ? d.bd            : [];
                 metas         = Array.isArray(d.metas)         ? d.metas         : [];
                 cats          = (d.cats && typeof d.cats === 'object') ? d.cats : CATS_PADRAO;
@@ -4356,55 +4413,52 @@ function _carregarDadosUsuario(uid){
                 recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
                 contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
                 metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-                // Atualiza cache offline
-                localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
-            } else {
-                // Novo usuário: inicia com padrões
-                bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
-                cats   = CATS_PADRAO;
-                contas = CONTAS_PADRAO;
-                // Remove eventual lixo de localStorage de outro usuário
-                localStorage.removeItem(`will_dados_${uid}`);
-            }
-            initFiltro(); render();
-            setTimeout(_verificarImportacaoPosMigracao, 2000);
-        })
-        .catch(() => {
-            // Offline: usa cache local como fallback
-            const cached = localStorage.getItem(`will_dados_${uid}`);
-            if(cached){
-                try {
-                    const d = JSON.parse(cached);
-                    bd            = Array.isArray(d.bd)            ? d.bd            : [];
-                    metas         = Array.isArray(d.metas)         ? d.metas         : [];
-                    cats          = (d.cats && typeof d.cats === 'object') ? d.cats : CATS_PADRAO;
-                    investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
-                    recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
-                    contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
-                    metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-                    mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
-                } catch(e) {
-                    bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
-                }
-            } else {
+                mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
+            } catch(e) {
                 bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
-                mostrarToast('📶 Sem conexão e sem cache local.', 'warn', 5000);
             }
-            initFiltro(); render();
-        });
+        } else {
+            bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
+            mostrarToast('📶 Sem conexão e sem cache local.', 'warn', 5000);
+        }
+        initFiltro(); render();
+    });
 }
 
-// ─── FIREBASE: SALVAR DADOS (Firestore + cache local) ───
+// ─── FIREBASE: SALVAR DADOS (Firestore particionado + cache local) ───
+// O Firestore tem limite de 1MB por documento.
+// Solução: cada coleção grande vira um documento separado dentro de 'dados'.
 function saveAll(){
     if(!usuarioAtual || _modoVisitante) return;
-    const uid   = usuarioAtual.id;
-    const dados = {bd,metas,cats,investimentos,recorrentes,contas,metasInv};
-    // Cache local (offline/rápido)
+    const uid  = usuarioAtual.id;
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    const dados = {bd, metas, cats, investimentos, recorrentes, contas, metasInv};
+    // Cache local (offline)
     localStorage.setItem(`will_dados_${uid}`, JSON.stringify(dados));
-    // Firestore (nuvem)
-    _db.collection('usuarios').doc(uid).collection('dados').doc('financeiro')
-        .set(dados)
-        .catch(() => {}); // falha silenciosa (offline)
+    // Firestore: salva em documentos separados para evitar limite de 1MB
+    const batch = _db.batch();
+    batch.set(base.doc('bd'),            { bd });
+    batch.set(base.doc('metas'),         { metas });
+    batch.set(base.doc('config'),        { cats, contas });
+    batch.set(base.doc('investimentos'), { investimentos, metasInv });
+    batch.set(base.doc('recorrentes'),   { recorrentes });
+    batch.commit().catch(() => {}); // falha silenciosa (offline)
+}
+
+// ─── FIREBASE: SALVAR DADOS (com retorno de Promise — para importação) ───
+function _saveAllPromise(){
+    if(!usuarioAtual || _modoVisitante) return Promise.resolve();
+    const uid  = usuarioAtual.id;
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    const dados = {bd, metas, cats, investimentos, recorrentes, contas, metasInv};
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify(dados));
+    const batch = _db.batch();
+    batch.set(base.doc('bd'),            { bd });
+    batch.set(base.doc('metas'),         { metas });
+    batch.set(base.doc('config'),        { cats, contas });
+    batch.set(base.doc('investimentos'), { investimentos, metasInv });
+    batch.set(base.doc('recorrentes'),   { recorrentes });
+    return batch.commit();
 }
 
 // ─── FIREBASE: VERIFICAR SESSÃO (onAuthStateChanged) ───
