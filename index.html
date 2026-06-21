@@ -4332,9 +4332,11 @@ function _atualizarHeaderUsuario(){
         : `${periodo}, ${_primeiroNome(usuarioAtual.nome)}!`;
 }
 
-// ─── FIREBASE: CARREGAR DADOS (Firestore particionado como fonte de verdade) ───
-// Documentos: 'bd', 'metas', 'config', 'investimentos', 'recorrentes'
-// Fallback: documento legado 'financeiro' (formato antigo de 1 doc só)
+// ─── FIREBASE: CARREGAR DADOS (Firestore chunks + fallbacks legados) ───
+// Formatos suportados (do mais novo ao mais antigo):
+//   v43+: bd_meta + bd_chunk_0..N + metas + config + investimentos + recorrentes
+//   v42:  bd (doc único) + metas + config + investimentos + recorrentes
+//   v40:  financeiro (tudo em 1 doc)
 function _carregarDadosUsuario(uid){
     const CATS_PADRAO = {
         Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],
@@ -4344,64 +4346,88 @@ function _carregarDadosUsuario(uid){
 
     const base = _db.collection('usuarios').doc(uid).collection('dados');
 
-    // Busca todos os documentos particionados em paralelo
+    // Passo 1: lê documentos fixos (metas, config, inv, rec, bd_meta, legados)
     Promise.all([
-        base.doc('bd').get(),
+        base.doc('bd_meta').get(),      // v43: metadado dos chunks
         base.doc('metas').get(),
         base.doc('config').get(),
         base.doc('investimentos').get(),
         base.doc('recorrentes').get(),
-        base.doc('financeiro').get()  // fallback legado
+        base.doc('bd').get(),           // v42: bd num único doc (fallback)
+        base.doc('financeiro').get()    // v40: tudo num doc (fallback antigo)
     ])
-    .then(([docBd, docMetas, docConfig, docInv, docRec, docLegado]) => {
-        // Verifica se existe o formato novo (particionado)
-        const temFormatoNovo = docBd.exists || docMetas.exists || docConfig.exists;
+    .then(([docBdMeta, docMetas, docConfig, docInv, docRec, docBdUnico, docLegado]) => {
 
-        if(temFormatoNovo){
-            // ── Formato particionado (v42+) ──
-            bd            = docBd.exists    ? (docBd.data().bd            || []) : [];
-            metas         = docMetas.exists ? (docMetas.data().metas       || []) : [];
+        // ── Aplica metas/config/inv/rec (comuns a todos os formatos novos) ──
+        function _aplicarMetaEtc(){
+            metas         = docMetas.exists ? (docMetas.data().metas || []) : [];
             investimentos = docInv.exists   ? (docInv.data().investimentos || []) : [];
-            metasInv      = docInv.exists   ? (docInv.data().metasInv      || []) : [];
-            recorrentes   = docRec.exists   ? (docRec.data().recorrentes   || []) : [];
+            metasInv      = docInv.exists   ? (docInv.data().metasInv || []) : [];
+            recorrentes   = docRec.exists   ? (docRec.data().recorrentes || []) : [];
             if(docConfig.exists){
                 const cfg = docConfig.data();
-                cats   = (cfg.cats   && typeof cfg.cats === 'object')      ? cfg.cats   : CATS_PADRAO;
-                contas = (Array.isArray(cfg.contas) && cfg.contas.length > 0) ? cfg.contas : CONTAS_PADRAO;
-            } else {
-                cats   = CATS_PADRAO;
-                contas = CONTAS_PADRAO;
-            }
+                cats   = (cfg.cats   && typeof cfg.cats   === 'object')         ? cfg.cats   : CATS_PADRAO;
+                contas = (Array.isArray(cfg.contas) && cfg.contas.length > 0)   ? cfg.contas : CONTAS_PADRAO;
+            } else { cats = CATS_PADRAO; contas = CONTAS_PADRAO; }
+        }
+
+        function _finalizar(){
+            localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+            initFiltro(); render();
+            setTimeout(_verificarImportacaoPosMigracao, 2000);
+        }
+
+        if(docBdMeta.exists){
+            // ── Formato v43+: chunks ──
+            const total = docBdMeta.data().total || 1;
+            const chunkPromises = [];
+            for(let i=0; i<total; i++) chunkPromises.push(base.doc(`bd_chunk_${i}`).get());
+            Promise.all(chunkPromises).then(chunkDocs => {
+                bd = chunkDocs
+                    .sort((a,b) => (a.data()?.chunk||0) - (b.data()?.chunk||0))
+                    .flatMap(d => d.exists ? (d.data().bd || []) : []);
+                _aplicarMetaEtc();
+                _finalizar();
+            }).catch(() => { bd=[]; _aplicarMetaEtc(); _finalizar(); });
+
+        } else if(docBdUnico.exists || docMetas.exists || docConfig.exists){
+            // ── Formato v42: bd num único doc ──
+            bd = docBdUnico.exists ? (docBdUnico.data().bd || []) : [];
+            _aplicarMetaEtc();
+            // Migra para v43 (chunks)
+            mostrarToast('🔄 Otimizando armazenamento...', 'info', 3000);
+            _saveAllPromise()
+                .then(() => docBdUnico.exists ? base.doc('bd').delete().catch(()=>{}) : null)
+                .catch(()=>{});
+            _finalizar();
+
         } else if(docLegado.exists){
-            // ── Formato legado (1 documento) → migra automaticamente ──
+            // ── Formato v40: tudo em 1 documento ──
             const d = docLegado.data();
             bd            = Array.isArray(d.bd)            ? d.bd            : [];
             metas         = Array.isArray(d.metas)         ? d.metas         : [];
-            cats          = (d.cats && typeof d.cats === 'object')           ? d.cats   : CATS_PADRAO;
+            cats          = (d.cats && typeof d.cats === 'object')            ? d.cats   : CATS_PADRAO;
             investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
             recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
-            contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
+            contas        = (Array.isArray(d.contas) && d.contas.length > 0)  ? d.contas : CONTAS_PADRAO;
             metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-            // Migra automaticamente para formato particionado
+            // Migra para v43 (chunks)
             mostrarToast('🔄 Migrando dados para novo formato...', 'info', 3000);
             _saveAllPromise()
                 .then(() => base.doc('financeiro').delete().catch(()=>{}))
                 .catch(()=>{});
-        } else {
-            // Novo usuário
-            bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
-            cats   = CATS_PADRAO;
-            contas = CONTAS_PADRAO;
-            localStorage.removeItem(`will_dados_${uid}`);
-        }
+            _finalizar();
 
-        // Atualiza cache offline
-        localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
-        initFiltro(); render();
-        setTimeout(_verificarImportacaoPosMigracao, 2000);
+        } else {
+            // Novo usuário sem dados
+            bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
+            cats = CATS_PADRAO; contas = CONTAS_PADRAO;
+            localStorage.removeItem(`will_dados_${uid}`);
+            _finalizar();
+        }
     })
     .catch(() => {
-        // Offline: usa cache local como fallback
+        // Offline: usa cache local
         const cached = localStorage.getItem(`will_dados_${uid}`);
         if(cached){
             try {
@@ -4425,40 +4451,85 @@ function _carregarDadosUsuario(uid){
     });
 }
 
-// ─── FIREBASE: SALVAR DADOS (Firestore particionado + cache local) ───
-// O Firestore tem limite de 1MB por documento.
-// Solução: cada coleção grande vira um documento separado dentro de 'dados'.
+// ─── FIREBASE: SALVAR DADOS (Firestore particionado + chunks para bd) ───
+// Firestore: limite de 1MB por documento e 500 ops por batch.
+// O array bd pode ter 2MB+, então é dividido em chunks de ~300 itens por documento.
+const BD_CHUNK_SIZE = 300;
+
+function _bdParaChunks(bdArr){
+    const chunks = [];
+    for(let i=0; i<bdArr.length; i+=BD_CHUNK_SIZE)
+        chunks.push(bdArr.slice(i, i+BD_CHUNK_SIZE));
+    return chunks.length ? chunks : [[]];
+}
+
+// Limpa chunks antigos se o número de chunks diminuiu (ex: após exclusões)
+function _limparChunksAntigos(base, totalChunks){
+    // Verifica os últimos 10 possíveis chunks extras e deleta
+    const promises = [];
+    for(let i = totalChunks; i < totalChunks + 10; i++){
+        promises.push(
+            base.doc(`bd_chunk_${i}`).get()
+                .then(d => { if(d.exists) return base.doc(`bd_chunk_${i}`).delete(); })
+                .catch(()=>{})
+        );
+    }
+    return Promise.all(promises);
+}
+
+function _buildBatch(uid){
+    const base   = _db.collection('usuarios').doc(uid).collection('dados');
+    const chunks = _bdParaChunks(bd);
+    // Cada batch suporta até 500 ops; usamos batches separados se necessário
+    const batches = [];
+    let   batch   = _db.batch();
+    let   ops     = 0;
+
+    // Chunks do bd
+    chunks.forEach((chunk, i) => {
+        if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+        batch.set(base.doc(`bd_chunk_${i}`), { bd: chunk, chunk: i, total: chunks.length });
+        ops++;
+    });
+    // Meta-documento: sabe quantos chunks existem
+    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+    batch.set(base.doc('bd_meta'), { total: chunks.length });
+    ops++;
+
+    // Outros documentos (pequenos, cabem em 1 batch)
+    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+    batch.set(base.doc('metas'),         { metas });           ops++;
+    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+    batch.set(base.doc('config'),        { cats, contas });     ops++;
+    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+    batch.set(base.doc('investimentos'), { investimentos, metasInv }); ops++;
+    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
+    batch.set(base.doc('recorrentes'),   { recorrentes });      ops++;
+
+    batches.push(batch);
+    return { batches, base, totalChunks: chunks.length };
+}
+
 function saveAll(){
     if(!usuarioAtual || _modoVisitante) return;
     const uid  = usuarioAtual.id;
-    const base = _db.collection('usuarios').doc(uid).collection('dados');
-    const dados = {bd, metas, cats, investimentos, recorrentes, contas, metasInv};
-    // Cache local (offline)
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify(dados));
-    // Firestore: salva em documentos separados para evitar limite de 1MB
-    const batch = _db.batch();
-    batch.set(base.doc('bd'),            { bd });
-    batch.set(base.doc('metas'),         { metas });
-    batch.set(base.doc('config'),        { cats, contas });
-    batch.set(base.doc('investimentos'), { investimentos, metasInv });
-    batch.set(base.doc('recorrentes'),   { recorrentes });
-    batch.commit().catch(() => {}); // falha silenciosa (offline)
+    // Cache local
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+    // Firestore em chunks
+    const { batches, base, totalChunks } = _buildBatch(uid);
+    batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
+        .then(() => _limparChunksAntigos(base, totalChunks))
+        .catch(() => {}); // falha silenciosa (offline)
 }
 
-// ─── FIREBASE: SALVAR DADOS (com retorno de Promise — para importação) ───
+// Versão com Promise (para importação aguardar conclusão)
 function _saveAllPromise(){
     if(!usuarioAtual || _modoVisitante) return Promise.resolve();
     const uid  = usuarioAtual.id;
-    const base = _db.collection('usuarios').doc(uid).collection('dados');
-    const dados = {bd, metas, cats, investimentos, recorrentes, contas, metasInv};
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify(dados));
-    const batch = _db.batch();
-    batch.set(base.doc('bd'),            { bd });
-    batch.set(base.doc('metas'),         { metas });
-    batch.set(base.doc('config'),        { cats, contas });
-    batch.set(base.doc('investimentos'), { investimentos, metasInv });
-    batch.set(base.doc('recorrentes'),   { recorrentes });
-    return batch.commit();
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+    const { batches, base, totalChunks } = _buildBatch(uid);
+    return batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
+        .then(() => _limparChunksAntigos(base, totalChunks));
 }
 
 // ─── FIREBASE: VERIFICAR SESSÃO (onAuthStateChanged) ───
