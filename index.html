@@ -1411,7 +1411,7 @@ function salvarRecorrente(){
         if(!jaExiste && confirm(`Lançar "${d.desc}" automaticamente em ${pSel.split('-').reverse().join('/')}?`)){
             const data = `${pSel}-${String(d.dia).padStart(2,'0')}`;
             bd.push({id:Date.now(), data, tipo:d.tipo, cat:d.cat, valor:d.valor, desc:d.desc, conta:d.conta, recId:d.id});
-            saveAll(); initFiltro();
+            saveAll();
             mostrarToast(`✅ "${d.desc}" lançado automaticamente em ${pSel.split('-').reverse().join('/')}!`, 'success', 5000);
         }
     }
@@ -1605,7 +1605,7 @@ function gerarRecorrente(r){
     const existe = bd.some(i=>i.recId===r.id && i.data.startsWith(pSel));
     if(existe){ mostrarToast('Já lançado neste mês!','warn',4000); return; }
     bd.push({id:Date.now(), data, tipo:r.tipo, cat:r.cat, valor:r.valor, desc:r.desc, conta:r.conta, recId:r.id});
-    saveAll(); initFiltro(); render();
+    saveAll(); render();
     mostrarToast(`✅ "${r.desc}" lançado em ${pSel.split('-').reverse().join('/')}!`, 'success', 4000);
 }
 function renderParcelasAtivas(){
@@ -2326,7 +2326,12 @@ function exportarExtratoPDF(){
 // =====================================================
 //  FILTRO DE PERÍODO (MÊS/ANO)
 // =====================================================
-function initFiltro(){
+// Flag: true depois do primeiro initFiltro completo — evita resetar filtro do usuário
+var _filtroInicializado = false;
+// Flag: true quando os dados do Firestore já foram carregados — evita saveAll prematuro
+var _dadosCarregados = false;
+
+function initFiltro(forcar){
     const anoEl    = document.getElementById('filtro-ano');
     const mesEl    = document.getElementById('filtro-mes');
     if(!anoEl || !mesEl) return;
@@ -2335,12 +2340,15 @@ function initFiltro(){
     const mesAtual = String(hoje.getMonth()+1).padStart(2,'0');
     const anos     = [];
     for(let a = anoAtual - 5; a <= anoAtual + 2; a++) anos.push(a);
-    anoEl.innerHTML = anos.map(a =>
-        `<option value="${a}" ${a===anoAtual?'selected':''}>${a}</option>`
-    ).join('');
-    // Sempre força mês e ano atuais ao inicializar
-    mesEl.value = mesAtual;
-    anoEl.value = String(anoAtual);
+    // Só reconstrói o <select> de anos se ainda não foi inicializado
+    if(!_filtroInicializado || forcar){
+        anoEl.innerHTML = anos.map(a =>
+            `<option value="${a}" ${a===anoAtual?'selected':''}>${a}</option>`
+        ).join('');
+        mesEl.value = mesAtual;
+        anoEl.value = String(anoAtual);
+        _filtroInicializado = true;
+    }
     sincFiltroAnoMes();
 }
 
@@ -2797,7 +2805,7 @@ function salvarLancamento(){
         const entrada = {...base, id:Date.now()+1, tipo:'Receita', cat:'Transferência', desc:`Transferência ← ${contaNome(parseInt(base.conta))}`, conta:parseInt(contaDest)};
         bd.push(saida, entrada);
         window._recriarParcelasFuturas = false;
-        _fecharModalRegistro(); saveAll(); initFiltro(); render();
+        _fecharModalRegistro(); saveAll(); render();
         mostrarToast('↔️ Transferência registrada!','success',3500);
         return;
     }
@@ -2830,7 +2838,7 @@ function salvarLancamento(){
         window._parcelaDataRef=null; window._dadosParcelaEdicao=null;
         window._totalParcelasGrupo=0; window._parcelasPassadas=0;
         _parcelaFuturaGrupo=null; _parcelaFuturaData=null;
-        _fecharModalRegistro(); saveAll(); initFiltro(); render();
+        _fecharModalRegistro(); saveAll(); render();
         mostrarToast('✅ Parcelas futuras atualizadas.','success',4000);
         return;
     }
@@ -2875,7 +2883,7 @@ function salvarLancamento(){
 
     window._recriarParcelasFuturas = false;
     removerComprovante();
-    _fecharModalRegistro(); saveAll(); initFiltro(); render();
+    _fecharModalRegistro(); saveAll(); render();
 }
 // =====================================================
 //  AÇÃO EM PARCELAMENTO — estado temporário
@@ -4155,6 +4163,8 @@ function fazerCadastro(){
 
 // ─── FIREBASE: LOGOUT ───
 function fazerLogout(){
+    _filtroInicializado = false; // reseta para próximo login
+    _dadosCarregados   = false; // reseta flag de carga
     _auth.signOut().then(() => {
         _modoVisitante = false;
         usuarioAtual   = null;
@@ -4372,8 +4382,11 @@ function _carregarDadosUsuario(uid){
         }
 
         function _finalizar(){
+            _dadosCarregados = true; // libera saveAll após carga completa
             localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
-            initFiltro(); render();
+            // initFiltro só força reset na primeira carga; recargas preservam o filtro atual do usuário
+            initFiltro();
+            render();
             setTimeout(_verificarImportacaoPosMigracao, 2000);
         }
 
@@ -4439,7 +4452,8 @@ function _carregarDadosUsuario(uid){
                 recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
                 contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
                 metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-                mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
+                _dadosCarregados = true; // cache local carregado — permite saveAll
+            mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
             } catch(e) {
                 bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
             }
@@ -4512,6 +4526,7 @@ function _buildBatch(uid){
 
 function saveAll(){
     if(!usuarioAtual || _modoVisitante) return;
+    if(!_dadosCarregados) return; // evita sobrescrever Firestore antes da carga terminar
     const uid  = usuarioAtual.id;
     // Cache local
     localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
@@ -4525,6 +4540,7 @@ function saveAll(){
 // Versão com Promise (para importação aguardar conclusão)
 function _saveAllPromise(){
     if(!usuarioAtual || _modoVisitante) return Promise.resolve();
+    if(!_dadosCarregados) return Promise.resolve(); // evita sobrescrever antes da carga
     const uid  = usuarioAtual.id;
     localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
     const { batches, base, totalChunks } = _buildBatch(uid);
