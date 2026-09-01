@@ -2779,18 +2779,19 @@ function salvarLancamento(){
     const tagsRaw = document.getElementById('f-tags').value;
     const tags = tagsRaw.split(',').map(t=>t.trim()).filter(Boolean);
 
+    // Monta objeto base sem campos undefined (Firestore rejeita undefined)
     const base = {
-        id:          idEx ? parseInt(idEx) : Date.now(),
-        data:        document.getElementById('f-data').value,
-        tipo:        tipo,
-        cat:         tipo === 'Transferência' ? 'Transferência' : document.getElementById('f-cat').value,
-        valor:       parseMoeda(document.getElementById('f-valor').value),
-        desc:        document.getElementById('f-desc').value || (tipo === 'Transferência' ? 'Transferência' : document.getElementById('f-cat').value),
-        conta:       document.getElementById('f-conta').value,
-        tags:        tags.length > 0 ? tags : undefined,
-        comprovante: _comprovanteBase64 || undefined,
-        comprovanteTipo: _comprovanteType || undefined
+        id:    idEx ? parseInt(idEx) : Date.now(),
+        data:  document.getElementById('f-data').value,
+        tipo:  tipo,
+        cat:   tipo === 'Transferência' ? 'Transferência' : document.getElementById('f-cat').value,
+        valor: parseMoeda(document.getElementById('f-valor').value),
+        desc:  document.getElementById('f-desc').value || (tipo === 'Transferência' ? 'Transferência' : document.getElementById('f-cat').value),
+        conta: document.getElementById('f-conta').value,
     };
+    if(tags.length > 0)        base.tags            = tags;
+    if(_comprovanteBase64)     base.comprovante      = _comprovanteBase64;
+    if(_comprovanteType)       base.comprovanteTipo  = _comprovanteType;
 
     if(!base.data || base.valor <= 0) return;
 
@@ -2867,12 +2868,13 @@ function salvarLancamento(){
             if(idx > -1){
                 // Preserva campos que não estão no formulário
                 const original = bd[idx];
-                bd[idx] = {
-                    ...base,
-                    parcelaGrupo:    original.parcelaGrupo,
-                    repeticaoGrupo:  original.repeticaoGrupo,
-                    repeticaoFreq:   original.repeticaoFreq
-                };
+                const editado = { ...base };
+                // Só preserva campos opcionais se existirem no original (evita undefined)
+                if(original.parcelaGrupo   !== undefined) editado.parcelaGrupo   = original.parcelaGrupo;
+                if(original.repeticaoGrupo !== undefined) editado.repeticaoGrupo = original.repeticaoGrupo;
+                if(original.repeticaoFreq  !== undefined) editado.repeticaoFreq  = original.repeticaoFreq;
+                if(original.pago           !== undefined) editado.pago           = original.pago;
+                bd[idx] = editado;
             } else {
                 bd.push(base);
             }
@@ -4396,11 +4398,34 @@ function _carregarDadosUsuario(uid){
             const chunkPromises = [];
             for(let i=0; i<total; i++) chunkPromises.push(base.doc(`bd_chunk_${i}`).get());
             Promise.all(chunkPromises).then(chunkDocs => {
-                bd = chunkDocs
+                const bdBruto = chunkDocs
                     .sort((a,b) => (a.data()?.chunk||0) - (b.data()?.chunk||0))
                     .flatMap(d => d.exists ? (d.data().bd || []) : []);
-                _aplicarMetaEtc();
-                _finalizar();
+                // Coleta IDs que precisam de comprovante
+                const idsComRef = bdBruto.filter(x => x.comprovante_ref).map(x => String(x.id));
+                if(idsComRef.length === 0){
+                    bd = bdBruto; _aplicarMetaEtc(); _finalizar();
+                } else {
+                    // Carrega comprovantes em paralelo e reidrata o bd
+                    const compPromises = idsComRef.map(id => base.doc(`comprovante_${id}`).get());
+                    Promise.all(compPromises).then(compDocs => {
+                        const compMap = {};
+                        compDocs.forEach(d => {
+                            if(d.exists){
+                                const idKey = d.id.replace('comprovante_','');
+                                compMap[idKey] = d.data();
+                            }
+                        });
+                        bd = bdBruto.map(item => {
+                            if(!item.comprovante_ref) return item;
+                            const comp = compMap[String(item.id)];
+                            if(!comp) return item;
+                            const { comprovante_ref, ...resto } = item;
+                            return { ...resto, comprovante: comp.data, comprovanteTipo: comp.tipo || '' };
+                        });
+                        _aplicarMetaEtc(); _finalizar();
+                    }).catch(() => { bd = bdBruto; _aplicarMetaEtc(); _finalizar(); });
+                }
             }).catch(() => { bd=[]; _aplicarMetaEtc(); _finalizar(); });
 
         } else if(docBdUnico.exists || docMetas.exists || docConfig.exists){
@@ -4468,7 +4493,7 @@ function _carregarDadosUsuario(uid){
 // ─── FIREBASE: SALVAR DADOS (Firestore particionado + chunks para bd) ───
 // Firestore: limite de 1MB por documento e 500 ops por batch.
 // O array bd pode ter 2MB+, então é dividido em chunks de ~300 itens por documento.
-const BD_CHUNK_SIZE = 300;
+const BD_CHUNK_SIZE = 100; // max ~800KB por chunk mesmo com dados ricos
 
 function _bdParaChunks(bdArr){
     const chunks = [];
@@ -4491,18 +4516,58 @@ function _limparChunksAntigos(base, totalChunks){
     return Promise.all(promises);
 }
 
+// Remove campos undefined/null de objetos antes de enviar ao Firestore
+function _limparUndefined(obj){
+    if(Array.isArray(obj)) return obj.map(_limparUndefined);
+    if(obj !== null && typeof obj === 'object'){
+        const clean = {};
+        for(const [k,v] of Object.entries(obj)){
+            if(v === undefined || v === null) continue;
+            clean[k] = _limparUndefined(v);
+        }
+        return clean;
+    }
+    return obj;
+}
+
+// Separa comprovantes (base64) do bd para não estourar o limite de 1MB por documento.
+// No bd principal, mantém apenas comprovante_ref:true como indicador de existência.
+// Os base64 ficam em: dados/comprovantes/{lancamentoId}
+function _separarComprovantes(bdArr, base, batches, getBatch){
+    const comps = {};
+    const bdLimpo = bdArr.map(item => {
+        if(!item.comprovante) return item;
+        // Guarda referência separada
+        comps[String(item.id)] = { data: item.comprovante, tipo: item.comprovanteTipo || '' };
+        // Remove base64 do item principal, deixa só flag
+        const { comprovante, comprovanteTipo, ...resto } = item;
+        return { ...resto, comprovante_ref: true };
+    });
+
+    // Salva comprovantes em documentos separados (1 doc por comprovante)
+    // Cada comprovante pode ser até 1MB — salva individualmente fora do batch
+    if(Object.keys(comps).length > 0){
+        Object.entries(comps).forEach(([id, comp]) => {
+            base.doc(`comprovante_${id}`).set(_limparUndefined(comp)).catch(()=>{});
+        });
+    }
+    return bdLimpo;
+}
+
 function _buildBatch(uid){
     const base   = _db.collection('usuarios').doc(uid).collection('dados');
-    const chunks = _bdParaChunks(bd);
-    // Cada batch suporta até 500 ops; usamos batches separados se necessário
     const batches = [];
     let   batch   = _db.batch();
     let   ops     = 0;
 
-    // Chunks do bd
+    // Separa comprovantes e obtém bd sem base64 embutido
+    const bdSemComp = _separarComprovantes(bd, base, batches, ()=>batch);
+    const chunks    = _bdParaChunks(bdSemComp);
+
+    // Chunks do bd — sem comprovantes, bem menores
     chunks.forEach((chunk, i) => {
         if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-        batch.set(base.doc(`bd_chunk_${i}`), { bd: chunk, chunk: i, total: chunks.length });
+        batch.set(base.doc(`bd_chunk_${i}`), _limparUndefined({ bd: chunk, chunk: i, total: chunks.length }));
         ops++;
     });
     // Meta-documento: sabe quantos chunks existem
@@ -4510,15 +4575,15 @@ function _buildBatch(uid){
     batch.set(base.doc('bd_meta'), { total: chunks.length });
     ops++;
 
-    // Outros documentos (pequenos, cabem em 1 batch)
+    // Outros documentos — limpa undefined antes de enviar ao Firestore
     if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('metas'),         { metas });           ops++;
+    batch.set(base.doc('metas'),         _limparUndefined({ metas }));           ops++;
     if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('config'),        { cats, contas });     ops++;
+    batch.set(base.doc('config'),        _limparUndefined({ cats, contas }));     ops++;
     if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('investimentos'), { investimentos, metasInv }); ops++;
+    batch.set(base.doc('investimentos'), _limparUndefined({ investimentos, metasInv })); ops++;
     if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('recorrentes'),   { recorrentes });      ops++;
+    batch.set(base.doc('recorrentes'),   _limparUndefined({ recorrentes }));      ops++;
 
     batches.push(batch);
     return { batches, base, totalChunks: chunks.length };
