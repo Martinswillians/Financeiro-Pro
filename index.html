@@ -298,16 +298,13 @@
             <div class="filtro-bloco">
                 <span class="filtro-bloco-label">Mês</span>
                 <select id="filtro-mes" onchange="sincFiltroAnoMes()" class="filtro-sel">
-                    <option value="01">Jan</option><option value="02">Fev</option><option value="03">Mar</option>
-                    <option value="04">Abr</option><option value="05">Mai</option><option value="06">Jun</option>
-                    <option value="07">Jul</option><option value="08">Ago</option><option value="09">Set</option>
-                    <option value="10">Out</option><option value="11">Nov</option><option value="12">Dez</option>
+                    <option value="01">Jan</option><option value="02">Fev</option><option value="03">Mar</option><option value="04">Abr</option><option value="05">Mai</option><option value="06">Jun</option><option value="07">Jul</option><option value="08">Ago</option><option value="09" selected>Set</option><option value="10">Out</option><option value="11">Nov</option><option value="12">Dez</option>
                 </select>
             </div>
             <div class="filtro-divider"></div>
             <div class="filtro-bloco">
                 <span class="filtro-bloco-label">Ano</span>
-                <select id="filtro-ano" onchange="sincFiltroAnoMes()" class="filtro-sel"></select>
+                <select id="filtro-ano" onchange="sincFiltroAnoMes()" class="filtro-sel"><option value="2021">2021</option><option value="2022">2022</option><option value="2023">2023</option><option value="2024">2024</option><option value="2025">2025</option><option value="2026" selected>2026</option><option value="2027">2027</option><option value="2028">2028</option></select>
             </div>
             <!-- Campo oculto mantido para compatibilidade com render() -->
             <input type="hidden" id="filtro-periodo" value="">
@@ -2340,15 +2337,29 @@ function initFiltro(forcar){
     const mesAtual = String(hoje.getMonth()+1).padStart(2,'0');
     const anos     = [];
     for(let a = anoAtual - 5; a <= anoAtual + 2; a++) anos.push(a);
-    // Só reconstrói o <select> de anos se ainda não foi inicializado
-    if(!_filtroInicializado || forcar){
+
+    // Sempre garante que o <select> de anos está populado
+    // (pode estar vazio no primeiro render com usuário já logado)
+    const anoVazio = anoEl.options.length === 0;
+    if(anoVazio || forcar || !_filtroInicializado){
         anoEl.innerHTML = anos.map(a =>
             `<option value="${a}" ${a===anoAtual?'selected':''}>${a}</option>`
         ).join('');
+    }
+
+    // Só reseta mês/ano para o atual na PRIMEIRA inicialização
+    if(!_filtroInicializado || forcar){
         mesEl.value = mesAtual;
         anoEl.value = String(anoAtual);
         _filtroInicializado = true;
     }
+
+    // Garante que um valor válido está selecionado (evita branco)
+    if(!anoEl.value || !mesEl.value){
+        mesEl.value = mesAtual;
+        anoEl.value = String(anoAtual);
+    }
+
     sincFiltroAnoMes();
 }
 
@@ -3498,6 +3509,7 @@ function abrirModalRegistro(){
 
 // Eventos dinâmicos: tags preview e repetição preview
 document.addEventListener('DOMContentLoaded', function(){
+    initFiltro(true);
     const tagsInput = document.getElementById('f-tags');
     if(tagsInput) tagsInput.addEventListener('input', atualizarTagsPreview);
     document.querySelectorAll('input[name="freq"]').forEach(r =>
