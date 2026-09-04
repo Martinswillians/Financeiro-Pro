@@ -4177,8 +4177,9 @@ function fazerCadastro(){
 
 // ─── FIREBASE: LOGOUT ───
 function fazerLogout(){
-    _filtroInicializado = false; // reseta para próximo login
-    _dadosCarregados   = false; // reseta flag de carga
+    _filtroInicializado  = false; // reseta para próximo login
+    _dadosCarregados     = false; // reseta flag de carga
+    _comprovantesCache   = {};   // limpa cache de comprovantes
     _auth.signOut().then(() => {
         _modoVisitante = false;
         usuarioAtual   = null;
@@ -4397,7 +4398,13 @@ function _carregarDadosUsuario(uid){
 
         function _finalizar(){
             _dadosCarregados = true; // libera saveAll após carga completa
-            localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+            // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
+    const _bdCache = bd.map(item => {
+        if(!item.comprovante) return item;
+        const { comprovante, comprovanteTipo, ...resto } = item;
+        return { ...resto, comprovante_ref: true };
+    });
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
             // initFiltro só força reset na primeira carga; recargas preservam o filtro atual do usuário
             initFiltro();
             render();
@@ -4413,31 +4420,10 @@ function _carregarDadosUsuario(uid){
                 const bdBruto = chunkDocs
                     .sort((a,b) => (a.data()?.chunk||0) - (b.data()?.chunk||0))
                     .flatMap(d => d.exists ? (d.data().bd || []) : []);
-                // Coleta IDs que precisam de comprovante
-                const idsComRef = bdBruto.filter(x => x.comprovante_ref).map(x => String(x.id));
-                if(idsComRef.length === 0){
-                    bd = bdBruto; _aplicarMetaEtc(); _finalizar();
-                } else {
-                    // Carrega comprovantes em paralelo e reidrata o bd
-                    const compPromises = idsComRef.map(id => base.doc(`comprovante_${id}`).get());
-                    Promise.all(compPromises).then(compDocs => {
-                        const compMap = {};
-                        compDocs.forEach(d => {
-                            if(d.exists){
-                                const idKey = d.id.replace('comprovante_','');
-                                compMap[idKey] = d.data();
-                            }
-                        });
-                        bd = bdBruto.map(item => {
-                            if(!item.comprovante_ref) return item;
-                            const comp = compMap[String(item.id)];
-                            if(!comp) return item;
-                            const { comprovante_ref, ...resto } = item;
-                            return { ...resto, comprovante: comp.data, comprovanteTipo: comp.tipo || '' };
-                        });
-                        _aplicarMetaEtc(); _finalizar();
-                    }).catch(() => { bd = bdBruto; _aplicarMetaEtc(); _finalizar(); });
-                }
+                // Reidrata comprovantes via cache+Firestore e finaliza
+                _reidratarComprovantes(bdBruto, base)
+                    .then(() => { _aplicarMetaEtc(); _finalizar(); })
+                    .catch(() => { bd = bdBruto; _aplicarMetaEtc(); _finalizar(); });
             }).catch(() => { bd=[]; _aplicarMetaEtc(); _finalizar(); });
 
         } else if(docBdUnico.exists || docMetas.exists || docConfig.exists){
@@ -4542,28 +4528,64 @@ function _limparUndefined(obj){
     return obj;
 }
 
-// Separa comprovantes (base64) do bd para não estourar o limite de 1MB por documento.
-// No bd principal, mantém apenas comprovante_ref:true como indicador de existência.
-// Os base64 ficam em: dados/comprovantes/{lancamentoId}
-function _separarComprovantes(bdArr, base, batches, getBatch){
-    const comps = {};
-    const bdLimpo = bdArr.map(item => {
+// Cache de comprovantes em memória: { [id]: { data: base64, tipo: string } }
+// O bd em memória SEMPRE mantém o base64 — só removemos na hora de salvar no Firestore
+var _comprovantesCache = {};
+
+// Ao salvar: retorna cópia do bd SEM base64 (para o Firestore) e salva comprovantes separado
+function _separarComprovantes(bdArr, base){
+    const bdParaFirestore = bdArr.map(item => {
         if(!item.comprovante) return item;
-        // Guarda referência separada
-        comps[String(item.id)] = { data: item.comprovante, tipo: item.comprovanteTipo || '' };
-        // Remove base64 do item principal, deixa só flag
+        // Atualiza cache em memória
+        _comprovantesCache[String(item.id)] = { data: item.comprovante, tipo: item.comprovanteTipo || '' };
+        // Salva doc separado no Firestore
+        base.doc(`comprovante_${item.id}`).set(
+            _limparUndefined({ data: item.comprovante, tipo: item.comprovanteTipo || '' })
+        ).catch(()=>{});
+        // Remove base64 do objeto que vai pro Firestore, mantém flag
         const { comprovante, comprovanteTipo, ...resto } = item;
         return { ...resto, comprovante_ref: true };
     });
+    return bdParaFirestore;
+}
 
-    // Salva comprovantes em documentos separados (1 doc por comprovante)
-    // Cada comprovante pode ser até 1MB — salva individualmente fora do batch
-    if(Object.keys(comps).length > 0){
-        Object.entries(comps).forEach(([id, comp]) => {
-            base.doc(`comprovante_${id}`).set(_limparUndefined(comp)).catch(()=>{});
+// Reidrata o bd com comprovantes do cache ou do Firestore
+function _reidratarComprovantes(bdBruto, base){
+    const idsComRef = bdBruto.filter(x => x.comprovante_ref).map(x => String(x.id));
+    // IDs que já estão no cache em memória
+    const idsNoCache    = idsComRef.filter(id => _comprovantesCache[id]);
+    const idsSemCache   = idsComRef.filter(id => !_comprovantesCache[id]);
+
+    function _aplicarCache(bdArr){
+        return bdArr.map(item => {
+            if(!item.comprovante_ref) return item;
+            const comp = _comprovantesCache[String(item.id)];
+            if(!comp) return item; // sem comprovante disponível
+            const { comprovante_ref, ...resto } = item;
+            return { ...resto, comprovante: comp.data, comprovanteTipo: comp.tipo || '' };
         });
     }
-    return bdLimpo;
+
+    if(idsSemCache.length === 0){
+        // Tudo no cache — aplica direto
+        bd = _aplicarCache(bdBruto);
+        return Promise.resolve();
+    }
+
+    // Busca os que faltam no Firestore
+    const compPromises = idsSemCache.map(id => base.doc(`comprovante_${id}`).get());
+    return Promise.all(compPromises).then(compDocs => {
+        compDocs.forEach(d => {
+            if(d.exists){
+                const idKey = d.id.replace('comprovante_','');
+                _comprovantesCache[idKey] = d.data();
+            }
+        });
+        bd = _aplicarCache(bdBruto);
+    }).catch(() => {
+        // Falha na busca — aplica o que tiver no cache
+        bd = _aplicarCache(bdBruto);
+    });
 }
 
 function _buildBatch(uid){
@@ -4572,8 +4594,8 @@ function _buildBatch(uid){
     let   batch   = _db.batch();
     let   ops     = 0;
 
-    // Separa comprovantes e obtém bd sem base64 embutido
-    const bdSemComp = _separarComprovantes(bd, base, batches, ()=>batch);
+    // Separa comprovantes e obtém cópia do bd sem base64 (bd em memória permanece intacto)
+    const bdSemComp = _separarComprovantes(bd, base);
     const chunks    = _bdParaChunks(bdSemComp);
 
     // Chunks do bd — sem comprovantes, bem menores
@@ -4606,7 +4628,13 @@ function saveAll(){
     if(!_dadosCarregados) return; // evita sobrescrever Firestore antes da carga terminar
     const uid  = usuarioAtual.id;
     // Cache local
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+    // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
+    const _bdCache = bd.map(item => {
+        if(!item.comprovante) return item;
+        const { comprovante, comprovanteTipo, ...resto } = item;
+        return { ...resto, comprovante_ref: true };
+    });
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
     // Firestore em chunks
     const { batches, base, totalChunks } = _buildBatch(uid);
     batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
@@ -4619,7 +4647,13 @@ function _saveAllPromise(){
     if(!usuarioAtual || _modoVisitante) return Promise.resolve();
     if(!_dadosCarregados) return Promise.resolve(); // evita sobrescrever antes da carga
     const uid  = usuarioAtual.id;
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd,metas,cats,investimentos,recorrentes,contas,metasInv}));
+    // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
+    const _bdCache = bd.map(item => {
+        if(!item.comprovante) return item;
+        const { comprovante, comprovanteTipo, ...resto } = item;
+        return { ...resto, comprovante_ref: true };
+    });
+    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
     const { batches, base, totalChunks } = _buildBatch(uid);
     return batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
         .then(() => _limparChunksAntigos(base, totalChunks));
