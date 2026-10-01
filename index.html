@@ -54,6 +54,10 @@
     firebase.initializeApp(firebaseConfig);
     const _auth = firebase.auth();
     const _db   = firebase.firestore();
+    // Conexão mais estável em Safari/iOS/redes móveis (evita "client is offline" e carga travada)
+    try { _db.settings({ experimentalAutoDetectLongPolling: true, merge: true }); } catch(e){}
+    // Grava em disco as escritas pendentes: se o app for fechado antes de enviar, elas não se perdem
+    try { _db.enablePersistence({ synchronizeTabs: true }).catch(function(){}); } catch(e){}
     </script>
 
 
@@ -2427,7 +2431,8 @@ function limparFiltrosExt(){
 function togglePago(id){
     const i = bd.find(x => x.id === id); if(!i) return;
     i.pago = !i.pago;
-    saveAll(); render();
+    try{ render(); }catch(e){ console.error(e); }
+    saveAll();
     mostrarToast(i.pago ? '✅ Marcado como pago!' : '⏳ Marcado como pendente!', 'info', 2000);
 }
 
@@ -3467,7 +3472,22 @@ function renderProjecaoAnualInv(anoF, aporteMesAtual){
 //  CATEGORIAS
 // =====================================================
 function adicionarCategoria(){ const n=document.getElementById('new-cat-nome').value.trim(),t=document.getElementById('new-cat-tipo').value; if(n&&!cats[t].includes(n)){cats[t].push(n);saveAll();render();document.getElementById('new-cat-nome').value='';} }
-function editarCategoria(t,n){ const novo=prompt("Novo nome:",n); if(novo&&novo.trim()!==""){cats[t]=cats[t].map(c=>c===n?novo:c);bd.forEach(i=>{if(i.cat===n)i.cat=novo;});saveAll();render();} }
+function editarCategoria(t,n){
+    const entrada = prompt("Novo nome:", n);
+    if(entrada === null) return;
+    const novo = entrada.trim();
+    if(!novo || novo === n) return;
+    // se já existe outra categoria com esse nome, apenas une (sem duplicar)
+    const jaExiste = cats[t].some(c => c === novo);
+    cats[t] = jaExiste ? cats[t].filter(c => c !== n) : cats[t].map(c => c === n ? novo : c);
+    bd.forEach(i => { if(i.cat === n && i.tipo === t) i.cat = novo; });
+    // as outras listas que guardam o nome da categoria também precisam acompanhar
+    metas.forEach(m => { if(m.cat === n) m.cat = novo; });
+    recorrentes.forEach(r => { if(r.cat === n && r.tipo === t) r.cat = novo; });
+    investimentos.forEach(v => { if(v.cat === n) v.cat = novo; });
+    saveAll(); render();
+    mostrarToast('✅ Categoria renomeada para "' + novo + '".', 'success', 3000);
+}
 function excluirCategoria(t,n){ if(confirm(`Excluir "${n}"?`)){cats[t]=cats[t].filter(c=>c!==n);saveAll();render();} }
 
 // =====================================================
@@ -4180,6 +4200,8 @@ function fazerLogout(){
     _filtroInicializado  = false; // reseta para próximo login
     _dadosCarregados     = false; // reseta flag de carga
     _comprovantesCache   = {};   // limpa cache de comprovantes
+    _compSync = {}; _reconciliado = false; _dirty = false; _rev = 0; _serverRev = 0; _carregando = false; _chunksNoServidor = 0;
+    clearTimeout(_saveTimer); clearTimeout(_retryTimer); clearTimeout(_loadRetryTimer);
     _auth.signOut().then(() => {
         _modoVisitante = false;
         usuarioAtual   = null;
@@ -4357,164 +4379,443 @@ function _atualizarHeaderUsuario(){
         : `${periodo}, ${_primeiroNome(usuarioAtual.nome)}!`;
 }
 
-// ─── FIREBASE: CARREGAR DADOS (Firestore chunks + fallbacks legados) ───
-// Formatos suportados (do mais novo ao mais antigo):
-//   v43+: bd_meta + bd_chunk_0..N + metas + config + investimentos + recorrentes
-//   v42:  bd (doc único) + metas + config + investimentos + recorrentes
-//   v40:  financeiro (tudo em 1 doc)
-function _carregarDadosUsuario(uid){
-    const CATS_PADRAO = {
-        Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],
-        Receita:['Salário','Freelance','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Restituição IRPF']
+// ═════════════════════════════════════════════════════════════════
+//  CAMADA DE DADOS v2 (anti-perda)
+//  • Cache local com controle de revisão + flag "dirty" (alterações não enviadas)
+//  • Nunca grava na nuvem antes de reconciliar com o servidor
+//  • Falha de carga NUNCA vira "dados vazios" (antes zerava e depois sobrescrevia)
+//  • Gravação serializada (uma por vez), atômica e sem apagar chunks "no escuro"
+//  • Retentativas automáticas + sincroniza ao voltar ao app / ao fechar
+// ═════════════════════════════════════════════════════════════════
+const _CATS_PADRAO = {
+    Despesa:['Alimentação','Transporte','Moradia','Lazer','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Academia','Saúde','Estudo'],
+    Receita:['Salário','Freelance','Ticket Alimentação','Ticket Refeição','Cartão Benefícios','Restituição IRPF']
+};
+const _CONTAS_PADRAO = [{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
+const BD_CHUNK_SIZE = 100;
+
+var _rev = 0;                 // revisão local (ms) da última alteração feita aqui
+var _serverRev = 0;           // última revisão do servidor que este aparelho conhece
+var _dirty = false;           // true = há alterações locais ainda não confirmadas na nuvem
+var _reconciliado = false;    // true = já lemos o servidor com sucesso nesta sessão (só então pode gravar)
+var _carregando = false;
+var _saving = false, _saveQueued = false, _savingPromise = Promise.resolve();
+var _saveTimer = null, _retryTimer = null, _loadRetryTimer = null;
+var _chunksNoServidor = 0;    // quantos chunks existem no servidor (para apagar sobras NA MESMA operação)
+var _ultimaLeitura = 0;
+var _compSync = {};           // id -> tamanho do comprovante já gravado
+var _comprovantesCache = {};  // id -> {data, tipo}
+
+// ── Indicador visual de sincronização ──
+function _statusSync(estado){
+    let el = document.getElementById('sync-status');
+    if(!el){
+        el = document.createElement('div');
+        el.id = 'sync-status';
+        el.style.cssText = 'position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);left:50%;transform:translateX(-50%);z-index:99999;padding:6px 14px;border-radius:20px;font-size:0.78rem;font-weight:600;color:#fff;box-shadow:0 2px 10px rgba(0,0,0,.25);display:none;max-width:92vw;text-align:center;cursor:pointer;';
+        el.onclick = function(){ _tentarNovamente(); };
+        document.body.appendChild(el);
+    }
+    clearTimeout(el._t);
+    const cfg = {
+        loading:    ['#3498db','⏳ Carregando seus dados...'],
+        saving:     ['#f39c12','☁️ Salvando...'],
+        ok:         ['#27ae60','✅ Salvo na nuvem'],
+        pendente:   ['#e67e22','📶 Sem conexão — alterações guardadas, serão enviadas depois'],
+        erro:       ['#e74c3c','⚠️ Falha ao sincronizar — toque para tentar de novo'],
+        falhaCarga: ['#e74c3c','⚠️ Não consegui carregar — toque para tentar de novo']
     };
-    const CONTAS_PADRAO = [{id:1,nome:'Conta Principal',tipo:'Corrente',cor:'#3498db'},{id:2,nome:'Carteira',tipo:'Carteira',cor:'#27ae60'}];
+    if(!cfg[estado]){ el.style.display = 'none'; return; }
+    el.style.background = cfg[estado][0];
+    el.innerText = cfg[estado][1];
+    el.style.display = 'block';
+    if(estado === 'ok') el._t = setTimeout(function(){ el.style.display = 'none'; }, 1800);
+}
 
-    const base = _db.collection('usuarios').doc(uid).collection('dados');
+function _comTimeout(p, ms){
+    return new Promise(function(res, rej){
+        const t = setTimeout(function(){ rej(new Error('timeout')); }, ms);
+        p.then(function(v){ clearTimeout(t); res(v); }, function(e){ clearTimeout(t); rej(e); });
+    });
+}
 
-    // Passo 1: lê documentos fixos (metas, config, inv, rec, bd_meta, legados)
-    Promise.all([
-        base.doc('bd_meta').get(),      // v43: metadado dos chunks
-        base.doc('metas').get(),
-        base.doc('config').get(),
-        base.doc('investimentos').get(),
-        base.doc('recorrentes').get(),
-        base.doc('bd').get(),           // v42: bd num único doc (fallback)
-        base.doc('financeiro').get()    // v40: tudo num doc (fallback antigo)
-    ])
-    .then(([docBdMeta, docMetas, docConfig, docInv, docRec, docBdUnico, docLegado]) => {
+// ── Utilitários de dados ──
+function _normalizar(d){
+    d = d || {};
+    return {
+        bd:            Array.isArray(d.bd) ? d.bd : [],
+        metas:         Array.isArray(d.metas) ? d.metas : [],
+        cats:          (d.cats && typeof d.cats === 'object' && !Array.isArray(d.cats)) ? d.cats : JSON.parse(JSON.stringify(_CATS_PADRAO)),
+        investimentos: Array.isArray(d.investimentos) ? d.investimentos : [],
+        recorrentes:   Array.isArray(d.recorrentes) ? d.recorrentes : [],
+        metasInv:      Array.isArray(d.metasInv) ? d.metasInv : [],
+        contas:        (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : _CONTAS_PADRAO.map(function(c){ return Object.assign({}, c); })
+    };
+}
+function _aplicarSnapshot(s){
+    bd = s.bd; metas = s.metas; cats = s.cats; investimentos = s.investimentos;
+    recorrentes = s.recorrentes; contas = s.contas; metasInv = s.metasInv;
+}
+function _mesclarBd(local, remoto){
+    const mapa = new Map();
+    (remoto || []).forEach(function(i){ mapa.set(String(i.id), i); });
+    (local  || []).forEach(function(i){ mapa.set(String(i.id), i); }); // versão local prevalece
+    return Array.from(mapa.values());
+}
+function _marcarSujo(){ _rev = Date.now(); _dirty = true; }
 
-        // ── Aplica metas/config/inv/rec (comuns a todos os formatos novos) ──
-        function _aplicarMetaEtc(){
-            metas         = docMetas.exists ? (docMetas.data().metas || []) : [];
-            investimentos = docInv.exists   ? (docInv.data().investimentos || []) : [];
-            metasInv      = docInv.exists   ? (docInv.data().metasInv || []) : [];
-            recorrentes   = docRec.exists   ? (docRec.data().recorrentes || []) : [];
-            if(docConfig.exists){
-                const cfg = docConfig.data();
-                cats   = (cfg.cats   && typeof cfg.cats   === 'object')         ? cfg.cats   : CATS_PADRAO;
-                contas = (Array.isArray(cfg.contas) && cfg.contas.length > 0)   ? cfg.contas : CONTAS_PADRAO;
-            } else { cats = CATS_PADRAO; contas = CONTAS_PADRAO; }
-        }
-
-        function _finalizar(){
-            _dadosCarregados = true; // libera saveAll após carga completa
-            // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
-    const _bdCache = bd.map(item => {
+function _bdSemComprovantes(){
+    return bd.map(function(item){
         if(!item.comprovante) return item;
         const { comprovante, comprovanteTipo, ...resto } = item;
         return { ...resto, comprovante_ref: true };
     });
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
-            // initFiltro só força reset na primeira carga; recargas preservam o filtro atual do usuário
-            initFiltro();
-            render();
-            setTimeout(_verificarImportacaoPosMigracao, 2000);
+}
+function _gravarCacheLocal(uid){
+    try{
+        localStorage.setItem('will_dados_' + uid, JSON.stringify({
+            bd:_bdSemComprovantes(), metas, cats, investimentos, recorrentes, contas, metasInv,
+            _rev:_rev, _serverRev:_serverRev, _dirty:_dirty
+        }));
+        return true;
+    }catch(e){ console.warn('Cache local indisponível:', e); return false; }
+}
+function _lerCacheLocal(uid){
+    try{ const s = localStorage.getItem('will_dados_' + uid); return s ? JSON.parse(s) : null; }
+    catch(e){ return null; }
+}
+
+// Categorias usadas por lançamentos mas ausentes da lista (ex.: "Filha" depois de renomear)
+function _repararCategoriasOrfas(){
+    const especiais = ['Transferência'].concat(typeof BENS_LISTA !== 'undefined' ? BENS_LISTA : []);
+    const achadas = {};
+    bd.forEach(function(i){
+        if(!i || !i.cat || (i.tipo !== 'Despesa' && i.tipo !== 'Receita')) return;
+        if(especiais.includes(i.cat)) return;
+        if(!Array.isArray(cats[i.tipo])) cats[i.tipo] = [];
+        if(!cats[i.tipo].includes(i.cat)){ cats[i.tipo].push(i.cat); achadas[i.cat] = (achadas[i.cat] || 0) + 1; }
+    });
+    const nomes = Object.keys(achadas);
+    if(nomes.length){
+        _marcarSujo();
+        mostrarToast('🔎 Recriei a categoria ' + nomes.map(function(n){ return '"' + n + '"'; }).join(', ') + ' (havia lançamentos nela). Renomeie ou ajuste em Config.', 'warn', 9000);
+    }
+}
+
+// ── LEITURA DO SERVIDOR (sempre source:'server' — nunca confunde cache com dado real) ──
+function _lerServidor(uid){
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    const g = function(ref){ return ref.get({ source: 'server' }); };
+    return Promise.all([
+        g(base.doc('bd_meta')), g(base.doc('metas')), g(base.doc('config')),
+        g(base.doc('investimentos')), g(base.doc('recorrentes')),
+        g(base.doc('bd')), g(base.doc('financeiro'))
+    ]).then(function(r){
+        const docMeta = r[0], docMetas = r[1], docConfig = r[2], docInv = r[3], docRec = r[4], docBdUnico = r[5], docLegado = r[6];
+        const comum = function(){
+            const cfg = docConfig.exists ? docConfig.data() : {};
+            return _normalizar({
+                metas:         docMetas.exists ? docMetas.data().metas : [],
+                investimentos: docInv.exists ? docInv.data().investimentos : [],
+                metasInv:      docInv.exists ? docInv.data().metasInv : [],
+                recorrentes:   docRec.exists ? docRec.data().recorrentes : [],
+                cats: cfg.cats, contas: cfg.contas
+            });
+        };
+        if(docMeta.exists){
+            const m = docMeta.data();
+            const total = m.total || 1;
+            const ps = [];
+            for(let i = 0; i < total; i++) ps.push(g(base.doc('bd_chunk_' + i)));
+            return Promise.all(ps).then(function(docs){
+                let faltando = 0;
+                const bdBruto = [];
+                docs.forEach(function(d){ if(!d.exists){ faltando++; } else { (d.data().bd || []).forEach(function(x){ bdBruto.push(x); }); } });
+                const incompleto = faltando > 0 || (typeof m.count === 'number' && bdBruto.length < m.count);
+                return Object.assign(comum(), { bd:bdBruto, formato:'v43', rev:m.rev || 0, chunks:total, incompleto:incompleto });
+            });
         }
-
-        if(docBdMeta.exists){
-            // ── Formato v43+: chunks ──
-            const total = docBdMeta.data().total || 1;
-            const chunkPromises = [];
-            for(let i=0; i<total; i++) chunkPromises.push(base.doc(`bd_chunk_${i}`).get());
-            Promise.all(chunkPromises).then(chunkDocs => {
-                const bdBruto = chunkDocs
-                    .sort((a,b) => (a.data()?.chunk||0) - (b.data()?.chunk||0))
-                    .flatMap(d => d.exists ? (d.data().bd || []) : []);
-                // Reidrata comprovantes via cache+Firestore e finaliza
-                _reidratarComprovantes(bdBruto, base)
-                    .then(() => { _aplicarMetaEtc(); _finalizar(); })
-                    .catch(() => { bd = bdBruto; _aplicarMetaEtc(); _finalizar(); });
-            }).catch(() => { bd=[]; _aplicarMetaEtc(); _finalizar(); });
-
-        } else if(docBdUnico.exists || docMetas.exists || docConfig.exists){
-            // ── Formato v42: bd num único doc ──
-            bd = docBdUnico.exists ? (docBdUnico.data().bd || []) : [];
-            _aplicarMetaEtc();
-            // Migra para v43 (chunks)
-            mostrarToast('🔄 Otimizando armazenamento...', 'info', 3000);
-            _saveAllPromise()
-                .then(() => docBdUnico.exists ? base.doc('bd').delete().catch(()=>{}) : null)
-                .catch(()=>{});
-            _finalizar();
-
-        } else if(docLegado.exists){
-            // ── Formato v40: tudo em 1 documento ──
-            const d = docLegado.data();
-            bd            = Array.isArray(d.bd)            ? d.bd            : [];
-            metas         = Array.isArray(d.metas)         ? d.metas         : [];
-            cats          = (d.cats && typeof d.cats === 'object')            ? d.cats   : CATS_PADRAO;
-            investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
-            recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
-            contas        = (Array.isArray(d.contas) && d.contas.length > 0)  ? d.contas : CONTAS_PADRAO;
-            metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-            // Migra para v43 (chunks)
-            mostrarToast('🔄 Migrando dados para novo formato...', 'info', 3000);
-            _saveAllPromise()
-                .then(() => base.doc('financeiro').delete().catch(()=>{}))
-                .catch(()=>{});
-            _finalizar();
-
-        } else {
-            // Novo usuário sem dados
-            bd=[]; metas=[]; investimentos=[]; recorrentes=[]; metasInv=[];
-            cats = CATS_PADRAO; contas = CONTAS_PADRAO;
-            localStorage.removeItem(`will_dados_${uid}`);
-            _finalizar();
+        if(docBdUnico.exists || docMetas.exists || docConfig.exists){
+            const s = comum(); s.bd = docBdUnico.exists ? (docBdUnico.data().bd || []) : [];
+            return Object.assign(s, { formato:'v42', rev:0, chunks:0, incompleto:false });
         }
-    })
-    .catch(() => {
-        // Offline: usa cache local
-        const cached = localStorage.getItem(`will_dados_${uid}`);
-        if(cached){
-            try {
-                const d = JSON.parse(cached);
-                bd            = Array.isArray(d.bd)            ? d.bd            : [];
-                metas         = Array.isArray(d.metas)         ? d.metas         : [];
-                cats          = (d.cats && typeof d.cats === 'object') ? d.cats : CATS_PADRAO;
-                investimentos = Array.isArray(d.investimentos)  ? d.investimentos : [];
-                recorrentes   = Array.isArray(d.recorrentes)    ? d.recorrentes   : [];
-                contas        = (Array.isArray(d.contas) && d.contas.length > 0) ? d.contas : CONTAS_PADRAO;
-                metasInv      = Array.isArray(d.metasInv)       ? d.metasInv      : [];
-                _dadosCarregados = true; // cache local carregado — permite saveAll
-            mostrarToast('📶 Offline — exibindo dados em cache.', 'warn', 5000);
-            } catch(e) {
-                bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
-            }
-        } else {
-            bd=[]; metas=[]; cats=CATS_PADRAO; investimentos=[]; recorrentes=[]; contas=CONTAS_PADRAO; metasInv=[];
-            mostrarToast('📶 Sem conexão e sem cache local.', 'warn', 5000);
+        if(docLegado.exists){
+            return Object.assign(_normalizar(docLegado.data()), { formato:'v40', rev:0, chunks:0, incompleto:false });
         }
-        initFiltro(); render();
+        return Object.assign(_normalizar({}), { formato:'vazio', rev:0, chunks:0, incompleto:false });
     });
 }
 
-// ─── FIREBASE: SALVAR DADOS (Firestore particionado + chunks para bd) ───
-// Firestore: limite de 1MB por documento e 500 ops por batch.
-// O array bd pode ter 2MB+, então é dividido em chunks de ~300 itens por documento.
-const BD_CHUNK_SIZE = 100; // max ~800KB por chunk mesmo com dados ricos
+function _lerServidorComRetry(uid, tentativas){
+    let n = 0;
+    const tentar = function(){
+        return _comTimeout(_lerServidor(uid), 15000).catch(function(err){
+            n++;
+            if(n >= tentativas) throw err;
+            return new Promise(function(r){ setTimeout(r, 1200 * n); }).then(tentar);
+        });
+    };
+    return tentar();
+}
 
+// ── CARGA INICIAL ──
+function _carregarDadosUsuario(uid){
+    if(_carregando) return;
+    _carregando = true;
+    clearTimeout(_loadRetryTimer);
+
+    const cache = _lerCacheLocal(uid);
+    const temCache = !!(cache && Array.isArray(cache.bd));
+
+    if(!_dadosCarregados && temCache){
+        // Mostra IMEDIATAMENTE o que está guardado neste aparelho
+        _aplicarSnapshot(_normalizar(cache));
+        _rev = cache._rev || 0;
+        _serverRev = cache._serverRev || 0;
+        _dirty = (cache._rev === undefined) ? true : !!cache._dirty; // cache de versão antiga: trata como "pode ter algo novo"
+        _dadosCarregados = true;
+        initFiltro(); render();
+    } else if(!_dadosCarregados){
+        _statusSync('loading');
+    }
+
+    _lerServidorComRetry(uid, 3).then(function(snap){
+        _ultimaLeitura = Date.now();
+        _chunksNoServidor = snap.chunks || 0;
+        let recuperados = 0;
+
+        if(temCache && _dirty){
+            // Há alterações locais pendentes: mantém o que é daqui e junta o que veio do servidor
+            const idsLocais = new Set(bd.map(function(i){ return String(i.id); }));
+            const sSnap = snap.bd.filter(function(i){ return !idsLocais.has(String(i.id)); }).length;
+            if(sSnap > 0) recuperados = sSnap;
+            bd = _mesclarBd(bd, snap.bd);
+            _marcarSujo();
+        } else {
+            if(snap.incompleto && temCache){
+                // Servidor perdeu chunks: recupera do cache local o que faltar
+                const idsServ = new Set(snap.bd.map(function(i){ return String(i.id); }));
+                recuperados = cache.bd.filter(function(i){ return !idsServ.has(String(i.id)); }).length;
+                snap.bd = _mesclarBd(cache.bd, snap.bd);
+            }
+            _aplicarSnapshot(snap);
+            if(snap.incompleto || snap.formato === 'v42' || snap.formato === 'v40') _marcarSujo();
+        }
+
+        _serverRev = snap.rev;
+        _dadosCarregados = true;
+        _reconciliado = true;
+        _repararCategoriasOrfas();
+        _gravarCacheLocal(uid);
+        initFiltro(); render();
+        setTimeout(_verificarImportacaoPosMigracao, 2000);
+
+        if(recuperados > 0 && snap.incompleto) mostrarToast('♻️ ' + recuperados + ' lançamento(s) recuperado(s) do cache deste aparelho.', 'success', 7000);
+
+        if(_dirty){
+            _sincronizar().then(function(){
+                const b = _db.collection('usuarios').doc(uid).collection('dados');
+                if(snap.formato === 'v42') b.doc('bd').delete().catch(function(){});
+                if(snap.formato === 'v40') b.doc('financeiro').delete().catch(function(){});
+            }).catch(function(){});
+        } else {
+            _statusSync('');
+        }
+        _hidratarComprovantes(uid);
+    }).catch(function(err){
+        console.warn('Falha ao ler servidor:', err);
+        _reconciliado = false;
+        if(temCache || _dadosCarregados){
+            _statusSync('pendente');
+            mostrarToast('📶 Sem conexão estável — exibindo os dados salvos neste aparelho.', 'warn', 6000);
+        } else {
+            _statusSync('falhaCarga');
+        }
+        // Nova tentativa automática (sem precisar fechar e abrir o app)
+        _loadRetryTimer = setTimeout(function(){
+            if(usuarioAtual && usuarioAtual.id === uid && !_reconciliado) _carregarDadosUsuario(uid);
+        }, 8000);
+    }).then(function(){ _carregando = false; });
+}
+
+function _hidratarComprovantes(uid){
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    const ids = bd.filter(function(x){ return x.comprovante_ref && !x.comprovante; }).map(function(x){ return String(x.id); });
+    if(!ids.length) return;
+    Promise.all(ids.map(function(id){
+        if(_comprovantesCache[id]) return null;
+        return base.doc('comprovante_' + id).get({ source:'server' })
+            .then(function(d){ if(d.exists) _comprovantesCache[id] = d.data(); })
+            .catch(function(){});
+    })).then(function(){
+        let mudou = false;
+        bd.forEach(function(item){
+            if(item.comprovante_ref && !item.comprovante){
+                const c = _comprovantesCache[String(item.id)];
+                if(c){ item.comprovante = c.data; item.comprovanteTipo = c.tipo || ''; delete item.comprovante_ref; _compSync[String(item.id)] = (c.data || '').length; mudou = true; }
+            }
+        });
+        if(mudou) { try{ render(); }catch(e){} }
+    });
+}
+
+// ── SALVAR ──
+function saveAll(){
+    try{
+        if(!usuarioAtual || _modoVisitante) return;
+        if(!_dadosCarregados) return;
+        _marcarSujo();
+        _gravarCacheLocal(usuarioAtual.id);   // 1º: garante que nada se perde localmente
+        _statusSync(_reconciliado ? 'saving' : 'pendente');
+        clearTimeout(_saveTimer);
+        _saveTimer = setTimeout(function(){ _sincronizar().catch(function(){}); }, 500);
+    }catch(e){ console.error('saveAll:', e); }
+}
+
+function _saveAllPromise(){
+    if(!usuarioAtual || _modoVisitante || !_dadosCarregados) return Promise.resolve();
+    _marcarSujo();
+    _gravarCacheLocal(usuarioAtual.id);
+    return _sincronizar(true);
+}
+
+// Antes de gravar, confere se outro aparelho gravou algo mais novo; se sim, mescla (não sobrescreve)
+function _verificarConflito(uid){
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    return _comTimeout(base.doc('bd_meta').get({ source:'server' }), 12000).then(function(d){
+        const revServ = d.exists ? (d.data().rev || 0) : 0;
+        if(d.exists) _chunksNoServidor = d.data().total || 0;
+        if(revServ > _serverRev){
+            return _comTimeout(_lerServidor(uid), 15000).then(function(snap){
+                bd = _mesclarBd(bd, snap.bd);
+                _chunksNoServidor = snap.chunks || 0;
+                _serverRev = snap.rev;
+                _marcarSujo();
+                mostrarToast('🔀 Mesclei alterações feitas em outro aparelho.', 'info', 5000);
+                try{ render(); }catch(e){}
+            });
+        }
+    });
+}
+
+function _commitTudo(uid, rev){
+    const base = _db.collection('usuarios').doc(uid).collection('dados');
+    const chunks = _bdParaChunks(_bdSemComprovantes());
+    const novosComp = {};
+    const compOps = [], ops = [];
+
+    bd.forEach(function(item){
+        if(!item.comprovante) return;
+        const id = String(item.id), len = item.comprovante.length;
+        _comprovantesCache[id] = { data:item.comprovante, tipo:item.comprovanteTipo || '' };
+        if(_compSync[id] !== len){
+            compOps.push(function(b){ b.set(base.doc('comprovante_' + id), _limparUndefined({ data:item.comprovante, tipo:item.comprovanteTipo || '' })); });
+            novosComp[id] = len;
+        }
+    });
+    chunks.forEach(function(c, i){
+        ops.push(function(b){ b.set(base.doc('bd_chunk_' + i), _limparUndefined({ bd:c, chunk:i, total:chunks.length, rev:rev })); });
+    });
+    ops.push(function(b){ b.set(base.doc('metas'),         _limparUndefined({ metas:metas })); });
+    ops.push(function(b){ b.set(base.doc('config'),        _limparUndefined({ cats:cats, contas:contas })); });
+    ops.push(function(b){ b.set(base.doc('investimentos'), _limparUndefined({ investimentos:investimentos, metasInv:metasInv })); });
+    ops.push(function(b){ b.set(base.doc('recorrentes'),   _limparUndefined({ recorrentes:recorrentes })); });
+    // Remove chunks que sobraram NA MESMA operação (antes: get+delete separado, que apagava dados novos)
+    for(let i = chunks.length; i < _chunksNoServidor; i++){
+        ops.push(function(b){ b.delete(base.doc('bd_chunk_' + i)); });
+    }
+    // Meta por último, com revisão e contagem (permite detectar dados incompletos)
+    ops.push(function(b){ b.set(base.doc('bd_meta'), { total:chunks.length, count:bd.length, rev:rev, atualizadoEm:Date.now() }); });
+
+    const grupos = [];
+    for(let i = 0; i < compOps.length; i += 5) grupos.push(compOps.slice(i, i + 5));
+    for(let i = 0; i < ops.length; i += 400) grupos.push(ops.slice(i, i + 400));
+
+    return grupos.reduce(function(p, grupo){
+        return p.then(function(){
+            const b = _db.batch();
+            grupo.forEach(function(fn){ fn(b); });
+            return b.commit();
+        });
+    }, Promise.resolve()).then(function(){
+        Object.assign(_compSync, novosComp);
+        _chunksNoServidor = chunks.length;
+    });
+}
+
+function _sincronizar(forcar){
+    clearTimeout(_saveTimer);
+    if(!usuarioAtual || _modoVisitante || !_dadosCarregados) return Promise.resolve();
+    if(!_dirty) return Promise.resolve();
+    if(!_reconciliado){
+        _statusSync('pendente');
+        return forcar ? Promise.reject(new Error('Sem conexão com a nuvem — alterações guardadas neste aparelho.')) : Promise.resolve();
+    }
+    if(_saving){ _saveQueued = true; return _savingPromise; }
+
+    _saving = true; _saveQueued = false;
+    const uid = usuarioAtual.id;
+    _statusSync('saving');
+
+    _savingPromise = _verificarConflito(uid).then(function(){
+        const revEnviada = _rev;
+        return _commitTudo(uid, revEnviada).then(function(){ return revEnviada; });
+    }).then(function(revEnviada){
+        _serverRev = revEnviada;
+        if(_rev === revEnviada) _dirty = false;
+        _gravarCacheLocal(uid);
+        _saving = false;
+        if(_dirty || _saveQueued){ _statusSync('saving'); _saveTimer = setTimeout(function(){ _sincronizar().catch(function(){}); }, 200); }
+        else _statusSync('ok');
+    }, function(err){
+        console.error('Falha ao sincronizar:', err);
+        _saving = false;
+        _statusSync('erro');
+        clearTimeout(_retryTimer);
+        _retryTimer = setTimeout(function(){ _sincronizar().catch(function(){}); }, 15000);
+        throw err;
+    });
+    return _savingPromise;
+}
+
+function _tentarNovamente(){
+    if(!usuarioAtual || _modoVisitante) return;
+    if(!_reconciliado) _carregarDadosUsuario(usuarioAtual.id);
+    else _sincronizar().catch(function(){});
+}
+
+// Ao voltar para o app: retoma carga, envia pendências ou atualiza dados de outros aparelhos
+function _aoVoltarAoApp(){
+    if(!usuarioAtual || _modoVisitante) return;
+    if(!_reconciliado){ _carregarDadosUsuario(usuarioAtual.id); return; }
+    if(_dirty){ _sincronizar().catch(function(){}); return; }
+    if(Date.now() - _ultimaLeitura > 30000 && !_carregando && !_saving){
+        const uid = usuarioAtual.id;
+        _comTimeout(_lerServidor(uid), 15000).then(function(snap){
+            _ultimaLeitura = Date.now();
+            if(_dirty || _saving) return;                 // usuário mexeu enquanto lia
+            if(snap.rev > _serverRev && !snap.incompleto){
+                _aplicarSnapshot(snap);
+                _serverRev = snap.rev; _chunksNoServidor = snap.chunks || 0;
+                _gravarCacheLocal(uid);
+                try{ render(); }catch(e){}
+                _hidratarComprovantes(uid);
+            }
+        }).catch(function(){});
+    }
+}
+document.addEventListener('visibilitychange', function(){
+    if(document.hidden){ _sincronizar().catch(function(){}); } else { _aoVoltarAoApp(); }
+});
+window.addEventListener('pagehide', function(){ _sincronizar().catch(function(){}); });
+window.addEventListener('online',   function(){ _aoVoltarAoApp(); });
+
+// ── Auxiliares mantidos ──
 function _bdParaChunks(bdArr){
     const chunks = [];
-    for(let i=0; i<bdArr.length; i+=BD_CHUNK_SIZE)
-        chunks.push(bdArr.slice(i, i+BD_CHUNK_SIZE));
+    for(let i = 0; i < bdArr.length; i += BD_CHUNK_SIZE) chunks.push(bdArr.slice(i, i + BD_CHUNK_SIZE));
     return chunks.length ? chunks : [[]];
 }
-
-// Limpa chunks antigos se o número de chunks diminuiu (ex: após exclusões)
-function _limparChunksAntigos(base, totalChunks){
-    // Verifica os últimos 10 possíveis chunks extras e deleta
-    const promises = [];
-    for(let i = totalChunks; i < totalChunks + 10; i++){
-        promises.push(
-            base.doc(`bd_chunk_${i}`).get()
-                .then(d => { if(d.exists) return base.doc(`bd_chunk_${i}`).delete(); })
-                .catch(()=>{})
-        );
-    }
-    return Promise.all(promises);
-}
-
-// Remove campos undefined/null de objetos antes de enviar ao Firestore
 function _limparUndefined(obj){
     if(Array.isArray(obj)) return obj.map(_limparUndefined);
     if(obj !== null && typeof obj === 'object'){
@@ -4528,168 +4829,34 @@ function _limparUndefined(obj){
     return obj;
 }
 
-// Cache de comprovantes em memória: { [id]: { data: base64, tipo: string } }
-// O bd em memória SEMPRE mantém o base64 — só removemos na hora de salvar no Firestore
-var _comprovantesCache = {};
-
-// Ao salvar: retorna cópia do bd SEM base64 (para o Firestore) e salva comprovantes separado
-function _separarComprovantes(bdArr, base){
-    const bdParaFirestore = bdArr.map(item => {
-        if(!item.comprovante) return item;
-        // Atualiza cache em memória
-        _comprovantesCache[String(item.id)] = { data: item.comprovante, tipo: item.comprovanteTipo || '' };
-        // Salva doc separado no Firestore
-        base.doc(`comprovante_${item.id}`).set(
-            _limparUndefined({ data: item.comprovante, tipo: item.comprovanteTipo || '' })
-        ).catch(()=>{});
-        // Remove base64 do objeto que vai pro Firestore, mantém flag
-        const { comprovante, comprovanteTipo, ...resto } = item;
-        return { ...resto, comprovante_ref: true };
-    });
-    return bdParaFirestore;
-}
-
-// Reidrata o bd com comprovantes do cache ou do Firestore
-function _reidratarComprovantes(bdBruto, base){
-    const idsComRef = bdBruto.filter(x => x.comprovante_ref).map(x => String(x.id));
-    // IDs que já estão no cache em memória
-    const idsNoCache    = idsComRef.filter(id => _comprovantesCache[id]);
-    const idsSemCache   = idsComRef.filter(id => !_comprovantesCache[id]);
-
-    function _aplicarCache(bdArr){
-        return bdArr.map(item => {
-            if(!item.comprovante_ref) return item;
-            const comp = _comprovantesCache[String(item.id)];
-            if(!comp) return item; // sem comprovante disponível
-            const { comprovante_ref, ...resto } = item;
-            return { ...resto, comprovante: comp.data, comprovanteTipo: comp.tipo || '' };
-        });
-    }
-
-    if(idsSemCache.length === 0){
-        // Tudo no cache — aplica direto
-        bd = _aplicarCache(bdBruto);
-        return Promise.resolve();
-    }
-
-    // Busca os que faltam no Firestore
-    const compPromises = idsSemCache.map(id => base.doc(`comprovante_${id}`).get());
-    return Promise.all(compPromises).then(compDocs => {
-        compDocs.forEach(d => {
-            if(d.exists){
-                const idKey = d.id.replace('comprovante_','');
-                _comprovantesCache[idKey] = d.data();
-            }
-        });
-        bd = _aplicarCache(bdBruto);
-    }).catch(() => {
-        // Falha na busca — aplica o que tiver no cache
-        bd = _aplicarCache(bdBruto);
-    });
-}
-
-function _buildBatch(uid){
-    const base   = _db.collection('usuarios').doc(uid).collection('dados');
-    const batches = [];
-    let   batch   = _db.batch();
-    let   ops     = 0;
-
-    // Separa comprovantes e obtém cópia do bd sem base64 (bd em memória permanece intacto)
-    const bdSemComp = _separarComprovantes(bd, base);
-    const chunks    = _bdParaChunks(bdSemComp);
-
-    // Chunks do bd — sem comprovantes, bem menores
-    chunks.forEach((chunk, i) => {
-        if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-        batch.set(base.doc(`bd_chunk_${i}`), _limparUndefined({ bd: chunk, chunk: i, total: chunks.length }));
-        ops++;
-    });
-    // Meta-documento: sabe quantos chunks existem
-    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('bd_meta'), { total: chunks.length });
-    ops++;
-
-    // Outros documentos — limpa undefined antes de enviar ao Firestore
-    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('metas'),         _limparUndefined({ metas }));           ops++;
-    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('config'),        _limparUndefined({ cats, contas }));     ops++;
-    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('investimentos'), _limparUndefined({ investimentos, metasInv })); ops++;
-    if(ops >= 490){ batches.push(batch); batch = _db.batch(); ops = 0; }
-    batch.set(base.doc('recorrentes'),   _limparUndefined({ recorrentes }));      ops++;
-
-    batches.push(batch);
-    return { batches, base, totalChunks: chunks.length };
-}
-
-function saveAll(){
-    if(!usuarioAtual || _modoVisitante) return;
-    if(!_dadosCarregados) return; // evita sobrescrever Firestore antes da carga terminar
-    const uid  = usuarioAtual.id;
-    // Cache local
-    // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
-    const _bdCache = bd.map(item => {
-        if(!item.comprovante) return item;
-        const { comprovante, comprovanteTipo, ...resto } = item;
-        return { ...resto, comprovante_ref: true };
-    });
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
-    // Firestore em chunks
-    const { batches, base, totalChunks } = _buildBatch(uid);
-    batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
-        .then(() => _limparChunksAntigos(base, totalChunks))
-        .catch(() => {}); // falha silenciosa (offline)
-}
-
-// Versão com Promise (para importação aguardar conclusão)
-function _saveAllPromise(){
-    if(!usuarioAtual || _modoVisitante) return Promise.resolve();
-    if(!_dadosCarregados) return Promise.resolve(); // evita sobrescrever antes da carga
-    const uid  = usuarioAtual.id;
-    // Salva bd sem base64 de comprovantes no cache local (ficam em _comprovantesCache)
-    const _bdCache = bd.map(item => {
-        if(!item.comprovante) return item;
-        const { comprovante, comprovanteTipo, ...resto } = item;
-        return { ...resto, comprovante_ref: true };
-    });
-    localStorage.setItem(`will_dados_${uid}`, JSON.stringify({bd:_bdCache,metas,cats,investimentos,recorrentes,contas,metasInv}));
-    const { batches, base, totalChunks } = _buildBatch(uid);
-    return batches.reduce((p, b) => p.then(() => b.commit()), Promise.resolve())
-        .then(() => _limparChunksAntigos(base, totalChunks));
-}
-
 // ─── FIREBASE: VERIFICAR SESSÃO (onAuthStateChanged) ───
 _auth.onAuthStateChanged(function(firebaseUser){
     if(firebaseUser){
-        _db.collection('usuarios').doc(firebaseUser.uid).get()
-            .then(doc => {
-                const nome = doc.exists ? (doc.data().nome || firebaseUser.displayName || 'Usuário') : (firebaseUser.displayName || 'Usuário');
-                _modoVisitante = false;
-                usuarioAtual   = { id: firebaseUser.uid, nome, email: firebaseUser.email };
-                _primeiroRender = true;
-                _alertasPeriodo = '';
-                document.getElementById('login-screen').classList.add('hidden');
+        // Evita recarregar/duplicar se o evento disparar de novo para o mesmo usuário
+        if(usuarioAtual && usuarioAtual.id === firebaseUser.uid && _dadosCarregados) return;
+        const uid = firebaseUser.uid;
+        _modoVisitante = false;
+        usuarioAtual   = { id: uid, nome: firebaseUser.displayName || 'Usuário', email: firebaseUser.email };
+        _primeiroRender = true;
+        _alertasPeriodo = '';
+        document.getElementById('login-screen').classList.add('hidden');
+        _atualizarHeaderUsuario();
+        // Dados começam a carregar JÁ (antes esperavam a leitura do perfil)
+        _carregarFotoUsuario(uid);
+        _carregarDadosUsuario(uid);
+        // Nome do perfil em paralelo
+        _db.collection('usuarios').doc(uid).get().then(function(doc){
+            if(doc.exists && doc.data().nome && usuarioAtual && usuarioAtual.id === uid){
+                usuarioAtual.nome = doc.data().nome;
                 _atualizarHeaderUsuario();
-                mostrarToast(`👋 Olá, ${_primeiroNome(nome)}! Bem-vindo(a).`, 'success', 4000);
-                // Carrega foto e dados em paralelo; initFiltro+render+_verificarImportacao ficam dentro de _carregarDadosUsuario
-                _carregarFotoUsuario(firebaseUser.uid);
-                _carregarDadosUsuario(firebaseUser.uid);
-            })
-            .catch(() => {
-                _modoVisitante = false;
-                usuarioAtual   = { id: firebaseUser.uid, nome: firebaseUser.displayName||'Usuário', email: firebaseUser.email };
-                _primeiroRender = true;
-                _alertasPeriodo = '';
-                document.getElementById('login-screen').classList.add('hidden');
-                _atualizarHeaderUsuario();
-                _carregarFotoUsuario(firebaseUser.uid);
-                _carregarDadosUsuario(firebaseUser.uid);
-            });
+            }
+        }).catch(function(){}).then(function(){
+            if(usuarioAtual && usuarioAtual.id === uid)
+                mostrarToast('👋 Olá, ' + _primeiroNome(usuarioAtual.nome) + '! Bem-vindo(a).', 'success', 4000);
+        });
     } else {
         document.getElementById('login-screen').classList.remove('hidden');
         mostrarLogin();
-        // Verifica dados locais para migração
         setTimeout(_verificarMigracao, 800);
     }
 });
